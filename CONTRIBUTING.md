@@ -2,3 +2,7 @@
 
 # Files
 - All relevant files starts with a short description comment.
+- sketch.txt describes the basic overall plan.
+
+
+
