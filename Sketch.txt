@@ -1,0 +1,314 @@
+PI AGENT (Email trigger + backend-owned DB + agent_rootfs filesystem + run_cli_in_container + SendImageToUser tool) — single-file spec
+
+# Rules of this file:
+- Never use wording new, uptated etc.
+- Always include entire file
+- When user asks for this file, return the actual updated file and not just the content in a chat as text.
+
+
+
+1) Goal
+- Barebone always-on agent loop on Raspberry Pi (or any Linux host).
+- Communicate via triggers from one or more sources (initially: email).
+- Keep long conversations coherent using a cheap summary model.
+- Store full chat log and message-level embeddings for recall.
+- Be crash-tolerant by reconstructing prompt state from SQLite every turn.
+- Run the agent’s “system-access the LLM can cause” (CLI/scripts) inside an agent filesystem that is isolated from backend files.
+- Keep secrets and sensitive identity data (API keys, IMAP/SMTP creds, endpoints, whitelist, identity mapping, etc.) out of Git by placing them in a private JSON file that is not committed.
+- Repo contains backend code + agent filesystem, but no sensitive data.
+
+
+2) Runtime split
+- main.py is BACKEND (admin-owned): always-on loop and dispatcher.
+- agentloop.py is BACKEND (admin-owned): runs one turn when main.py dispatches an inbound trigger.
+- Backend (admin-owned) provides:
+  - trigger polling (IMAP for email initially)
+  - outbound sending (SMTP for email initially)
+  - LLM proxy (chat + embed + summarize)
+  - the SQLite database (append-only)
+  - attachment handling (decode/attach images)
+  - agent CLI runner (run_cli_in_container)
+  - private config loader (system.private.json)
+- Agent filesystem (agent_rootfs) provides:
+  - workspace/preferences.md and workspace/skills.md
+  - workspace/tools/ scripts (created/updated by the agent)
+  - workspace/out/ output folder for generated artifacts
+- Agent must not access backend files; backend must not be exposed to the agent filesystem.
+
+
+3) Hard rule: runtime always sends LLM output
+- The LLM does NOT decide whether an email is sent.
+- Every LLM text response is always emailed back to the triggering sender by the runtime.
+- The only exception-like behavior is attachments: images can be sent via an explicit LLM tool call.
+
+
+4) Minimal per-turn pipeline (email trigger)
+1. main.py tick loop (backend).
+2. If due: backend polls inbox (poll_inbox()).
+3. Backend connects to IMAP using values from system.private.json, scans unread mail headers (metadata) and filters senders via whitelist/person mapping.
+4. Backend dedupe:
+   - For each candidate email, obtain event_id from headers (for email: Message-ID).
+   - Backend checks DB for existence by (source, event_id).
+   - If exists: mark email as Seen in IMAP immediately (avoid buildup) and continue.
+   - If not exists: fetch full email (including text + images), convert to deterministic mail_to_user_prompt(mail) (text + base64 images), and return the oldest such email.
+5. main.py receives {person, source, sender_handle, event_id, user_prompt, ...}.
+6. Backend persists the inbound user message to DB (append-only).
+7. Backend builds the chat context (summary + last X Q/A groups) for that person.
+8. Backend reads preferences.md and skills.md from agent_rootfs/workspace and injects them each turn.
+9. Backend calls llm_chat() with that context to generate assistant text (+ optional tool call requests).
+10. Tool loop:
+   - The only explicit LLM tool is SendImageToUser.
+   - Any other “capability” is implemented as scripts in agent_rootfs/workspace/tools/ executed via run_cli_in_container.
+11. Backend persists assistant response to DB with message_reference pointing to the triggering user event_id.
+12. Backend updates summary (cheap summarizer) and persists it.
+13. Runtime sends reply email via backend send_mail() containing the assistant text.
+14. If SendImageToUser was called, backend also attaches the produced image(s).
+
+
+5) Identity + whitelist model (backend-owned)
+- Backend holds an in-memory mapping from person -> identities.
+- Backend holds a whitelist of persons allowed to trigger the agent.
+- Both whitelist and persons mapping are stored in system.private.json.
+
+Example (conceptual):
+- whitelist = ["Eskil", "Kona"]
+- persons = {
+    "Eskil": ["eskil@example.com", "@eskil:matrix.example"],
+    "Kona":  ["kona@example.com"]
+  }
+
+Rules:
+- For each inbound trigger, backend resolves sender_handle to a person by scanning persons mapping.
+- If person not found OR person not in whitelist: ignore trigger.
+- The resolved person name (string) is used as the conversation partition key.
+
+
+6) Storage (SQLite in backend)
+- SQLite append-only log lives in backend-owned backend/state/.
+- The database is person-centric and represents an endless conversation per person, independent of communication technology.
+- Email threads are NOT used to group or separate chat history.
+
+Messages table columns:
+- id: INTEGER PK
+- person: TEXT (e.g. "Eskil")
+- source: TEXT
+  - For inbound: integration source name (e.g. "email")
+  - For assistant/tool rows: model name (e.g. "gpt-5-mini", "mistral-large")
+- sender_handle: TEXT (raw sender identity from the source, e.g. email address). For assistant/tool rows can be empty string.
+- event_id: TEXT (unique identifier from the source system; for email this is Message-ID)
+- role: TEXT ("user" | "assistant" | "tool")
+- kind: TEXT ("message" | "tool_call" | "tool_result")
+- text: TEXT (payload; for tool_call/tool_result can be JSON serialized)
+- timestamp: INTEGER (unix seconds or unix ms; choose one and be consistent)
+- message_reference: TEXT
+  - NULL for the inbound user question.
+  - For assistant/tool rows: event_id of the user question this row belongs to.
+- tool_name: TEXT (nullable)
+- tool_call_id: TEXT (nullable) ties tool_call <-> tool_result
+- is_error: INTEGER (0/1)
+- embedding: BLOB (nullable)
+
+Summary:
+- Summary is stored in backend DB (separate table) keyed by person.
+
+
+7) Chatlog construction for LLM (per person)
+- When a trigger arrives, only build history for that resolved person.
+- The chatlog consists of:
+  - system prompt
+  - preferences.md and skills.md injected each turn (read from agent_rootfs/workspace)
+  - a user “summary+question” message where the first part is current summary and the second part is the new question
+  - the last X prior Q/A groups, optionally including tool_call/tool_result rows that belong to those questions
+
+Grouping model:
+- Each inbound user question is a root event:
+  - role="user" AND kind="message" AND message_reference IS NULL
+- All rows that belong to that question share:
+  - message_reference == <root event_id>
+
+Ordering:
+- Within a question group: order by (timestamp, id) ascending.
+- Across question groups: order root user questions by (timestamp, id) ascending.
+
+
+8) Avoiding bad requests (message sequencing)
+- For the LLM prompt you must never output two consecutive same-role messages.
+- Tool rows are persisted as role="tool" and kind distinguishes call/result.
+- During prompt reconstruction, transform stored rows into the exact provider API message format.
+
+
+9) Tools / scripts model
+- Built-in runtime capability: run_cli_in_container(...)
+- Explicit LLM tool: SendImageToUser (because images cannot reliably be embedded together with text in the same response)
+- Everything else is implemented as scripts placed under agent_rootfs/workspace/tools/ and executed via run_cli_in_container.
+- agent_rootfs/workspace/tools/tools.md is the registry of scripts and how to invoke them.
+
+run_cli_in_container contract:
+- Input: cmd (string), args (string[]), cwd (string), timeout_s (int)
+- Output: { exit_code, stdout, stderr }
+- CLI is executed inside the agent environment.
+- Agent environment must not contain backend files or private config.
+
+Agent environment model:
+- agent_rootfs is a host directory that represents the entire agent filesystem.
+- The agent sees agent_rootfs as its full filesystem ("/").
+- Admin can browse and edit agent_rootfs directly via Remote Desktop and VS Code.
+
+
+10) SendImageToUser (explicit LLM tool)
+Purpose:
+- Allow the LLM to request sending an image attachment while the runtime still always emails the text response.
+
+Contract:
+- Input: base64 (raw or data URL), filename, mime
+- Recipient: always the triggering sender (LLM cannot specify recipients)
+- Runtime:
+  - decode -> write file under agent_rootfs/workspace/out/
+  - attach to the outgoing email (or send a separate attachment email, but default is same reply)
+- Persistence:
+  - store tool_call and tool_result rows in DB with message_reference=<trigger user event_id>
+
+
+11) Preferences and skills (must be on agent side)
+- preferences.md: general behavioral preferences.
+- skills.md: operational rules and “how to use this environment”, including:
+  - how to edit preferences.md via CLI (overwrite entire file)
+  - how to edit skills.md via CLI (overwrite entire file)
+  - that scripts live under tools/"
+  - that tools/tools.md must be updated when creating new scripts
+
+
+12) Error handling
+- main.py wraps each agentloop turn in try/except.
+- On exception:
+  - send user-friendly error email
+  - persist assistant message with is_error=1 and message_reference pointing to the triggering user event_id
+
+
+13) Self-extension
+- The agent may create new scripts under workspace/tools/ (inside agent_rootfs).
+- Every new script must be registered in tools/tools.md with purpose + exact cli invocation examples.
+
+
+14) Minimal repository layout + separation
+
+One Git repo contains:
+- backend/ (backend runtime code)
+- agent_rootfs/ (agent filesystem root)
+- docs/ and scripts/ as needed
+- .gitignore rules that exclude private config and backend runtime state
+
+Backend-owned runtime state (not committed):
+- backend/state/
+  - agent.db
+  - agent.db-wal
+  - agent.db-shm
+
+Private config (not committed):
+- backend/system.private.json is NOT stored in the repo.
+- backend/system.private.json must be excluded by .gitignore.
+- backend/system.private.json must contain all sensitive values, including:
+  - API keys
+  - IMAP/SMTP credentials
+  - endpoints
+  - whitelist
+  - persons mapping
+  - any other sensitive identity data
+
+Agent filesystem (committed):
+- agent_rootfs/
+  - workspace/
+    - preferences.md
+    - skills.md
+    - tools/
+      - tools.md
+      - *.py (scripts)
+    - out/
+  - usr/
+  - etc/
+  - var/
+  - opt/
+  - (any other directories required by the agent runtime)
+
+Access rules:
+- Backend reads and writes agent_rootfs files directly on the host filesystem.
+- Agent can read/write only the agent filesystem.
+- Agent must not access backend/ or backend/system.private.json.
+
+
+15) Backend API (internal modules)
+Operations (minimal):
+- poll_inbox() -> null | {person, source, sender_handle, event_id, subject, sent_ts, received_ts, user_prompt}
+- persist_message(row) -> ok/error
+- build_context(person, anchor_event_id, max_pairs) -> {summary, history_messages}
+- send_mail(reply_to_event_id, to, subject, body, attachments?) -> ok/error
+- llm_chat(messages, model, params) ->assistant_text (+ optional tool call requests)
+- llm_embed(texts) -> vectors
+- llm_summarize(text) -> summary
+- message_exists(source, event_id) -> true/false
+- run_cli_in_container(cmd, args, cwd, timeout_s) -> {exit_code, stdout, stderr}
+
+
+16) Private config file requirements (system.private.json)
+- Backend must load a private JSON config file at startup from backend/system.private.json.
+- The private config file is required for the system to run.
+- If the file does not exist:
+  - Backend must create a template JSON file containing all required keys with placeholder values.
+  - Backend must exit with a clear error telling the user to fill the file and restart.
+- The private config schema is enforced by code:
+  - A class parses JSON and validates required fields and types.
+  - The class mirrors the JSON structure.
+
+Minimum required keys (conceptual):
+- email: { imap_host, imap_user, imap_pass, smtp_host, smtp_user, smtp_pass }
+- llm: { chat_endpoint, embed_endpoint, summarize_endpoint, api_key }
+- whitelist: [ "PersonName", ... ]
+- persons: { "PersonName": [ "identity", ... ], ... }
+- runtime: { max_pairs, poll_interval_sec, ... }
+
+
+17) Installation process
+- Clone the repo.
+- Run main.py directly: backend/main.py.
+- Backend will check whether the agent-image runtime exists. If it does not exist, backend will trigger podman build -t agent-image . automatically.
+- Backend will verify that backend/system.private.json exists. If it does not exist, backend will generate a template and exit with instructions.
+- When system.private.json is correctly filled in, main.py continues.
+- Backend runs the always-on loop.
+- When tools are executed, backend will launch the agent environment by calling run_cli_in_container.
+
+
+18) SQLite schema (backend)
+PRAGMA journal_mode=WAL;
+
+CREATE TABLE IF NOT EXISTS summaries (
+  person TEXT PRIMARY KEY,
+  summary TEXT NOT NULL DEFAULT '',
+  updated_ts INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  person TEXT NOT NULL,
+  source TEXT NOT NULL,
+  sender_handle TEXT NOT NULL,
+  event_id TEXT NOT NULL,
+  role TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  text TEXT NOT NULL,
+  timestamp INTEGER NOT NULL,
+  message_reference TEXT,
+  tool_name TEXT,
+  tool_call_id TEXT,
+  is_error INTEGER NOT NULL DEFAULT 0,
+  embedding BLOB,
+  UNIQUE(source, event_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_messages_person_time
+  ON messages(person, timestamp, id);
+
+CREATE INDEX IF NOT EXISTS idx_messages_person_ref
+  ON messages(person, message_reference);
+
+CREATE INDEX IF NOT EXISTS idx_messages_tool_call_id
+  ON messages(tool_call_id);
