@@ -14,7 +14,17 @@ The repository features a clear separation between backend and agent environment
 A private JSON configuration file is utilized to securely manage API keys and credentials within the repository. This practice safeguards sensitive information essential for operation.
 
 ### SQLite Database
-An SQLite database serves as an append-only log, facilitating coherent and person-centric conversation storage. This structure allows for systematic record-keeping and retrieval of interactions.
+An SQLite database stores explicit conversations and messages. A sender can have multiple
+conversations, and each email thread maps to exactly one PodHead conversation.
+
+## Conversation Routing Rules
+- One shared workspace/container is used for all conversations.
+- Sender whitelist validation happens before routing, conversation creation, LLM processing, and replies.
+- A new standalone email from a whitelisted sender starts a new conversation.
+- A reply with `In-Reply-To`/`References` continues an existing conversation when the referenced
+  message belongs to the same normalized sender.
+- Conversation history is loaded by conversation ID, so only messages from the resolved
+  conversation are sent to the agent.
 
 ### Event Listening
 The main script (`Main.py`) continuously polls an email inbox (example provided) to monitor incoming events. The workflow comprises scanning, validating, and triggering deployments based on events that have been authenticated via the backend.
