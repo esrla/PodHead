@@ -1,5 +1,9 @@
 # Contains the agent loop
 
+# Path to the workspace guide injected as a system instruction each turn.
+# The file lives inside the container; change this to relocate the guide.
+AGENT_WORKSPACE_GUIDE = "/workspace/AGENT.md"
+
 # Expected Functionality:
 # The agent loop processes one interaction (per turn) when triggered by main.py. Below is the expected functionality:
 # 1. Trigger Implementation:
@@ -15,6 +19,8 @@
 #      - Summarizing previous interactions using a lightweight model.
 #      - Fetching the last few question/answer groups.
 #    - Loads preferences and operational skills from agent_rootfs/workspace.
+#    - Injects a short system instruction telling the agent to read the workspace guide
+#      at AGENT_WORKSPACE_GUIDE (default: /workspace/AGENT.md) inside the container.
 # 
 # 4. LLM Call:
 #    - Calls the Language Model API (LLM) to:
