@@ -78,57 +78,46 @@ Example (conceptual):
   }
 
 Rules:
-- For each inbound trigger, backend resolves sender_handle to a person by scanning persons mapping.
-- If person not found OR person not in whitelist: ignore trigger.
-- The resolved person name (string) is used as the conversation partition key.
+- For each inbound trigger, backend resolves sender_handle to a normalized sender email address.
+- Sender whitelist must be checked before routing, conversation creation, LLM processing, and reply sending.
+- If sender not found OR sender not in whitelist: ignore trigger.
 
 
 6) Storage (SQLite in backend)
 - SQLite append-only log lives in backend-owned backend/state/.
-- The database is person-centric and represents an endless conversation per person, independent of communication technology.
-- Email threads are NOT used to group or separate chat history.
+- The database stores explicit conversations and messages.
+- One sender may have multiple conversations.
+- One email thread maps to one conversation.
+
+Conversations table columns:
+- id: INTEGER PK
+- sender_normalized: TEXT
+- created_ts: INTEGER
+- last_activity_ts: INTEGER nullable
 
 Messages table columns:
 - id: INTEGER PK
-- person: TEXT (e.g. "Eskil")
-- source: TEXT
-  - For inbound: integration source name (e.g. "email")
-  - For assistant/tool rows: model name (e.g. "gpt-5-mini", "mistral-large")
-- sender_handle: TEXT (raw sender identity from the source, e.g. email address). For assistant/tool rows can be empty string.
-- event_id: TEXT (unique identifier from the source system; for email this is Message-ID)
-- role: TEXT ("user" | "assistant" | "tool")
-- kind: TEXT ("message" | "tool_call" | "tool_result")
-- text: TEXT (payload; for tool_call/tool_result can be JSON serialized)
+- conversation_id: INTEGER FK
+- email_message_id: TEXT (email Message-ID, unique when present)
+- direction: TEXT ("incoming" | "outgoing")
+- content: TEXT
 - timestamp: INTEGER (unix seconds or unix ms; choose one and be consistent)
-- message_reference: TEXT
-  - NULL for the inbound user question.
-  - For assistant/tool rows: event_id of the user question this row belongs to.
-- tool_name: TEXT (nullable)
-- tool_call_id: TEXT (nullable) ties tool_call <-> tool_result
-- is_error: INTEGER (0/1)
-- embedding: BLOB (nullable)
-
-Summary:
-- Summary is stored in backend DB (separate table) keyed by person.
+- in_reply_to: TEXT nullable
+- references_header: TEXT nullable
 
 
-7) Chatlog construction for LLM (per person)
-- When a trigger arrives, only build history for that resolved person.
+7) Chatlog construction for LLM (per conversation)
+- When a trigger arrives, route to one conversation.
+- Resolve with In-Reply-To first.
+- If unresolved, inspect References newest to oldest.
+- Reuse only conversations owned by the same normalized sender.
+- If no valid match exists, create a new conversation.
+- Build history from the resolved conversation_id only.
 - The chatlog consists of:
   - system prompt
   - preferences.md and skills.md injected each turn (read from agent_rootfs/workspace)
   - a user “summary+question” message where the first part is current summary and the second part is the new question
-  - the last X prior Q/A groups, optionally including tool_call/tool_result rows that belong to those questions
-
-Grouping model:
-- Each inbound user question is a root event:
-  - role="user" AND kind="message" AND message_reference IS NULL
-- All rows that belong to that question share:
-  - message_reference == <root event_id>
-
-Ordering:
-- Within a question group: order by (timestamp, id) ascending.
-- Across question groups: order root user questions by (timestamp, id) ascending.
+  - the prior turns from that conversation only
 
 
 8) Avoiding bad requests (message sequencing)
@@ -280,35 +269,30 @@ Minimum required keys (conceptual):
 18) SQLite schema (backend)
 PRAGMA journal_mode=WAL;
 
-CREATE TABLE IF NOT EXISTS summaries (
-  person TEXT PRIMARY KEY,
-  summary TEXT NOT NULL DEFAULT '',
-  updated_ts INTEGER NOT NULL
+CREATE TABLE IF NOT EXISTS conversations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  sender_normalized TEXT NOT NULL,
+  created_ts INTEGER NOT NULL,
+  last_activity_ts INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  person TEXT NOT NULL,
-  source TEXT NOT NULL,
-  sender_handle TEXT NOT NULL,
-  event_id TEXT NOT NULL,
-  role TEXT NOT NULL,
-  kind TEXT NOT NULL,
-  text TEXT NOT NULL,
+  conversation_id INTEGER NOT NULL,
+  email_message_id TEXT UNIQUE,
+  direction TEXT NOT NULL,
+  content TEXT NOT NULL,
   timestamp INTEGER NOT NULL,
-  message_reference TEXT,
-  tool_name TEXT,
-  tool_call_id TEXT,
-  is_error INTEGER NOT NULL DEFAULT 0,
-  embedding BLOB,
-  UNIQUE(source, event_id)
+  in_reply_to TEXT,
+  references_header TEXT,
+  FOREIGN KEY(conversation_id) REFERENCES conversations(id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_messages_person_time
-  ON messages(person, timestamp, id);
+CREATE INDEX IF NOT EXISTS idx_messages_conversation_time
+  ON messages(conversation_id, timestamp, id);
 
-CREATE INDEX IF NOT EXISTS idx_messages_person_ref
-  ON messages(person, message_reference);
+CREATE INDEX IF NOT EXISTS idx_messages_email_message_id
+  ON messages(email_message_id);
 
-CREATE INDEX IF NOT EXISTS idx_messages_tool_call_id
-  ON messages(tool_call_id);
+CREATE INDEX IF NOT EXISTS idx_conversations_sender
+  ON conversations(sender_normalized);
