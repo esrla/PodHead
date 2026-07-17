@@ -138,7 +138,7 @@ class Agent:
                     try:
                         result = handler(args, self)
                     except Exception as exc:  # noqa: BLE001
-                        result = f"Error: {exc}"
+                        result = f"Error in tool '{tool_name}': {exc}"
                 self.conversation_history.append(
                     {
                         "role": "tool",

@@ -138,11 +138,10 @@ def main():
         max_children=max_children,
     )
 
-    # Mail processing loop placeholder.
-    # Replace with real IMAP polling when email credentials are configured.
+    # TODO: replace with real IMAP polling loop once email credentials are configured.
     print("[PodHead] Backend initialized. Waiting for incoming email (not yet polled).")
     print(f"[PodHead] Whitelist: {whitelist}")
-    _ = conn, run_agent  # referenced to satisfy linter until polling is wired
+    _ = conn, run_agent  # referenced until polling is wired
 
 
 if __name__ == "__main__":
