@@ -1,7 +1,8 @@
 import sqlite3
+from email.message import EmailMessage
 
 from backhead import db
-from backhead.mail import IncomingEmail, build_reply_email, process_incoming_email, store_incoming_email
+from backhead.mail import IncomingEmail, _extract_text_body, build_reply_email, process_incoming_email, store_incoming_email
 
 
 
@@ -138,8 +139,8 @@ def test_process_incoming_email_marks_failed_message_for_retry():
             run_agent=raising_agent,
             send_reply=lambda outgoing: None,
         )
-    except RuntimeError:
-        pass
+    except RuntimeError as exc:
+        assert str(exc) == "boom"
     else:
         raise AssertionError("Expected RuntimeError")
 
@@ -174,6 +175,43 @@ def test_deterministic_history_ordering_uses_timestamp_then_id():
     )
     ordered_ids = [row["id"] for row in db.get_conversation_history(conn, conversation_id)]
     assert ordered_ids == [first_id, second_id]
+
+
+
+def test_row_to_message_conversion_includes_subject_and_state():
+    conn = _conn()
+    conversation_id = db.create_conversation(conn, "alice@example.com", created_ts=1)
+    message_id = db.insert_message(
+        conn,
+        conversation_id=conversation_id,
+        email_message_id="<m@example.com>",
+        direction="incoming",
+        content="body",
+        subject="subject",
+        timestamp=2,
+        process_state=db.FAILED,
+        failure_details="details",
+    )
+    row = db.get_message(conn, message_id)
+    assert row["subject"] == "subject"
+    assert row["process_state"] == db.FAILED
+    assert row["failure_details"] == "details"
+
+
+
+def test_extract_text_body_prefers_plain_text_and_skips_attachments():
+    message = EmailMessage()
+    message.set_content("plain text")
+    message.add_alternative("<p>html text</p>", subtype="html")
+    message.add_attachment(b"bytes", maintype="application", subtype="octet-stream", filename="file.bin")
+    assert _extract_text_body(message) == "plain text"
+
+
+
+def test_extract_text_body_uses_html_when_plain_text_missing():
+    message = EmailMessage()
+    message.add_alternative("<p>html only</p>", subtype="html")
+    assert _extract_text_body(message) == "<p>html only</p>"
 
 
 

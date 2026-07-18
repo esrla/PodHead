@@ -161,9 +161,9 @@ def verify_container_environment(config: AppConfig) -> None:
         if source == WORKSPACE_HOST_PATH:
             continue
         if source in forbidden_sources:
-            raise PodmanVerificationError("Backend code or configuration is mounted into the container.")
+            raise PodmanVerificationError("Backend code or private configuration is mounted directly into the container.")
         if BACKEND_PATH in source.parents or PRIVATE_CONFIG_PATH.parent in source.parents:
-            raise PodmanVerificationError("Backend code or configuration is mounted into the container.")
+            raise PodmanVerificationError("A parent directory containing backend code or private configuration is mounted into the container.")
 
     completed = subprocess.run(
         ["podman", "exec", config.podman_container_name, "test", "-f", "/workspace/AGENT.md"],
@@ -351,8 +351,8 @@ async def schedule_conversation(runtime: RuntimeContext, conversation_id: int, r
         task = asyncio.create_task(_process_conversation(runtime, conversation_id, run_agent, container_runner))
         runtime.processing_tasks[conversation_id] = task
 
-        def _cleanup(_, conversation_id=conversation_id):
-            runtime.processing_tasks.pop(conversation_id, None)
+        def _cleanup(_, cid=conversation_id):
+            runtime.processing_tasks.pop(cid, None)
 
         task.add_done_callback(_cleanup)
 

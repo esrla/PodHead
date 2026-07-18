@@ -7,7 +7,7 @@ import sqlite3
 from unittest.mock import MagicMock
 
 from backhead import db
-from backhead.agent_loop import Agent, HISTORY_SEPARATOR, history_to_openai_messages
+from backhead.agent_loop import Agent, HISTORY_SEPARATOR, history_to_openai_messages, tool_error_result
 from backhead.main import build_email_agent_runner
 from backhead.tools.spawn_subagent import SPAWN_SUBAGENT_SCHEMA, create_spawn_subagent_tool
 
@@ -55,6 +55,18 @@ def _fake_client(*responses):
     completions = _FakeCompletions(responses)
     client.chat.completions = completions
     return client, completions
+
+
+
+def test_tool_error_result_structure():
+    assert tool_error_result("tool_execution_error", "Command failed.", "details") == {
+        "ok": False,
+        "error": {
+            "type": "tool_execution_error",
+            "message": "Command failed.",
+            "details": "details",
+        },
+    }
 
 
 
