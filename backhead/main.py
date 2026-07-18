@@ -22,7 +22,7 @@ STATE_DIR = REPO_ROOT / "state"
 DB_PATH = STATE_DIR / "agent.db"
 CONTAINER_IMAGE_NAME = "podhead-agent-image"
 WORKSPACE_HOST_PATH = (REPO_ROOT / "head_pod" / "workspace").resolve()
-PRIVATE_CONFIG_PATH = (Path(__file__).resolve().parent / "private_config.py").resolve()
+PRIVATE_CONFIG_PATH = Path(__file__).resolve().parent / "private_config.py"
 BACKEND_PATH = (REPO_ROOT / "backhead").resolve()
 
 
@@ -161,9 +161,9 @@ def verify_container_environment(config: AppConfig) -> None:
         if source == WORKSPACE_HOST_PATH:
             continue
         if source in forbidden_sources:
-            raise PodmanVerificationError("Backend code or private configuration is mounted directly into the container.")
+            raise PodmanVerificationError(f"Forbidden mount detected: {source}")
         if BACKEND_PATH in source.parents or PRIVATE_CONFIG_PATH.parent in source.parents:
-            raise PodmanVerificationError("A parent directory containing backend code or private configuration is mounted into the container.")
+            raise PodmanVerificationError(f"Forbidden parent mount detected: {source}")
 
     completed = subprocess.run(
         ["podman", "exec", config.podman_container_name, "test", "-f", "/workspace/AGENT.md"],
@@ -223,7 +223,23 @@ def _message_to_incoming_email(row: dict, sender: str) -> mail.IncomingEmail:
 
 
 
+
+
+def validate_config(config: AppConfig) -> None:
+    placeholder_values = {
+        config.main_agent.api_key,
+        config.main_agent.model,
+        config.subagent.api_key,
+        config.subagent.model,
+        config.email_account.password,
+        config.imap.password,
+        config.smtp.password,
+    }
+    if any(value.startswith("replace-") for value in placeholder_values):
+        raise ValueError("Replace the demonstration values in backhead/private_config.py before running PodHead.")
+
 def bootstrap(config: AppConfig = CONFIG) -> None:
+    validate_config(config)
     subprocess.run(["podman", "--version"], check=True, capture_output=True, text=True)
     ensure_state_dir()
     subprocess.run(
@@ -376,6 +392,7 @@ async def poll_and_schedule(runtime: RuntimeContext, run_agent, container_runner
 
 
 async def run_backend(config: AppConfig = CONFIG) -> None:
+    validate_config(config)
     verify_container_environment(config)
     conn = open_db_connection()
     runtime = RuntimeContext(config, conn)

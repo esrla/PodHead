@@ -336,6 +336,7 @@ def process_incoming_email(
             email_message_id=outgoing_message_id,
             direction="outgoing",
             content=assistant_text,
+            subject=outgoing.subject,
             process_state=db.COMPLETED,
         )
         db.update_message_state(conn, result["message_row_id"], db.COMPLETED)

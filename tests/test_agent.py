@@ -180,7 +180,7 @@ def test_spawn_subagent_starts_fresh_history_and_uses_configured_model():
 
 def test_subagents_can_call_spawn_subagent_recursively():
     sub_client, completions = _fake_client(
-        _FakeResponse(None, [_FakeToolCall("outer", "spawn_subagent", json.dumps({"prompt": "inner"}))]),
+        _FakeResponse(None, [_FakeToolCall("outer", "spawn_subagent", {"prompt": "inner"})]),
         _FakeResponse("inner complete"),
         _FakeResponse("outer complete"),
     )

@@ -49,9 +49,7 @@ def history_to_openai_messages(history_rows: list[dict]) -> list[dict]:
 
         if messages and messages[-1]["role"] == role:
             previous = messages[-1].get("content") or ""
-            messages[-1]["content"] = (
-                f"{previous}{HISTORY_SEPARATOR}{content}" if previous else content
-            )
+            messages[-1]["content"] = f"{previous}{HISTORY_SEPARATOR}{content}"
             continue
 
         messages.append({"role": role, "content": content})
