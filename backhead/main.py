@@ -351,7 +351,7 @@ async def schedule_conversation(runtime: RuntimeContext, conversation_id: int, r
         task = asyncio.create_task(_process_conversation(runtime, conversation_id, run_agent, container_runner))
         runtime.processing_tasks[conversation_id] = task
 
-        def _cleanup(_, cid=conversation_id):
+        def _cleanup(_task, cid=conversation_id):
             runtime.processing_tasks.pop(cid, None)
 
         task.add_done_callback(_cleanup)

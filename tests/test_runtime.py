@@ -16,6 +16,8 @@ from backhead.private_config import (
 )
 from backhead.tools.cli_tool import create_cli_tool
 
+SIMULATED_AGENT_DELAY = 0.1
+MAX_CONCURRENT_PROCESSING_TIME = 0.18
 
 
 def _config(maximum_concurrent_conversations: int = 2) -> AppConfig:
@@ -99,7 +101,7 @@ def test_async_processing_of_different_conversations(monkeypatch):
     monkeypatch.setattr(mail, "send_reply_smtp", lambda outgoing, smtp_config: None)
 
     def run_agent(history, incoming_message):
-        time.sleep(0.1)
+        time.sleep(SIMULATED_AGENT_DELAY)
         return f"reply:{incoming_message['content']}"
 
     async def run_test():
@@ -110,7 +112,7 @@ def test_async_processing_of_different_conversations(monkeypatch):
         return time.perf_counter() - start
 
     elapsed = asyncio.run(run_test())
-    assert elapsed < 0.18
+    assert elapsed < MAX_CONCURRENT_PROCESSING_TIME
 
 
 

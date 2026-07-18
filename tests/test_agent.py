@@ -17,7 +17,7 @@ class _FakeToolCall:
         self.id = call_id
         self.function = MagicMock()
         self.function.name = name
-        self.function.arguments = arguments
+        self.function.arguments = arguments if isinstance(arguments, str) else json.dumps(arguments)
 
 
 class _FakeMessage:
