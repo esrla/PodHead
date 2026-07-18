@@ -1,15 +1,10 @@
-"""Backend tool: spawn_subagent.
-
-Exposes a single ``spawn_subagent`` function to the model.  The model
-provides only the child prompt; all other configuration is supplied by the
-backend via ``create_spawn_subagent_tool()``.
-"""
+"""Backend tool: spawn_subagent."""
 
 from __future__ import annotations
 
 from typing import Any
 
-from backhead.agent_loop import create_agent
+from backhead.agent_loop import Agent, tool_error_result
 
 SPAWN_SUBAGENT_SCHEMA: dict[str, Any] = {
     "type": "function",
@@ -45,29 +40,32 @@ def create_spawn_subagent_tool(
     max_depth: int = 2,
     max_children: int = 4,
 ) -> tuple[dict, Any]:
-    """Return ``(schema, handler)`` for the ``spawn_subagent`` tool.
-
-    The returned handler accepts ``(args, calling_agent)`` where
-    ``calling_agent`` is the parent ``Agent`` instance.  The model only
-    ever sees ``{"prompt": "..."}`` in the tool schema.
-
-    Child agents are created through the same ``create_agent()`` helper used
-    by ``main.py``, with fresh conversation history and the configuration
-    captured in this closure.
-    """
-
-    def handler(args: dict, calling_agent: Any) -> str:
+    def handler(args: dict, calling_agent: Any) -> str | dict:
+        prompt = args.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            return tool_error_result(
+                "tool_execution_error",
+                "Missing or invalid parameter.",
+                "Expected a non-empty string in args['prompt'].",
+            )
         if calling_agent.depth >= calling_agent.max_depth:
-            return "Error: maximum spawn depth reached."
+            return tool_error_result(
+                "tool_execution_error",
+                "Maximum spawn depth reached.",
+                f"Current depth {calling_agent.depth} cannot exceed {calling_agent.max_depth}.",
+            )
         if calling_agent._children_spawned >= calling_agent.max_children:
-            return "Error: maximum child count reached."
-        calling_agent._children_spawned += 1
+            return tool_error_result(
+                "tool_execution_error",
+                "Maximum child count reached.",
+                f"Agent already spawned {calling_agent._children_spawned} children.",
+            )
 
-        child = create_agent(
+        calling_agent._children_spawned += 1
+        child = Agent(
             openai_client=openai_client,
             model=model,
             system_prompt=system_prompt,
-            conversation_history=None,
             tools=tools,
             tool_handlers=tool_handlers,
             container_runner=container_runner,
@@ -75,6 +73,13 @@ def create_spawn_subagent_tool(
             max_depth=max_depth,
             max_children=max_children,
         )
-        return child.run(args["prompt"])
+        try:
+            return {"ok": True, "response": child.run(prompt)}
+        except Exception as exc:  # noqa: BLE001
+            return tool_error_result(
+                getattr(exc, "error_type", "tool_execution_error"),
+                "Subagent failed.",
+                str(exc),
+            )
 
     return SPAWN_SUBAGENT_SCHEMA, handler
