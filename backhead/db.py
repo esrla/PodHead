@@ -275,9 +275,10 @@ def reset_processing_messages(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         UPDATE messages
-        SET process_state='pending', failure_details=NULL
-        WHERE direction='incoming' AND process_state='processing'
-        """
+        SET process_state=?, failure_details=NULL
+        WHERE direction='incoming' AND process_state=?
+        """,
+        (PENDING, PROCESSING),
     )
     conn.commit()
 
@@ -286,9 +287,10 @@ def requeue_failed_messages(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         UPDATE messages
-        SET process_state='pending'
-        WHERE direction='incoming' AND process_state='failed'
-        """
+        SET process_state=?
+        WHERE direction='incoming' AND process_state=?
+        """,
+        (PENDING, FAILED),
     )
     conn.commit()
 

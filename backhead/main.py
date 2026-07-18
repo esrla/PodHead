@@ -22,7 +22,7 @@ STATE_DIR = REPO_ROOT / "state"
 DB_PATH = STATE_DIR / "agent.db"
 CONTAINER_IMAGE_NAME = "podhead-agent-image"
 WORKSPACE_HOST_PATH = (REPO_ROOT / "head_pod" / "workspace").resolve()
-PRIVATE_CONFIG_PATH = (REPO_ROOT / "backhead" / "private_config.py").resolve()
+PRIVATE_CONFIG_PATH = (Path(__file__).resolve().parent / "private_config.py").resolve()
 BACKEND_PATH = (REPO_ROOT / "backhead").resolve()
 
 
@@ -351,8 +351,8 @@ async def schedule_conversation(runtime: RuntimeContext, conversation_id: int, r
         task = asyncio.create_task(_process_conversation(runtime, conversation_id, run_agent, container_runner))
         runtime.processing_tasks[conversation_id] = task
 
-        def _cleanup(_task, cid=conversation_id):
-            runtime.processing_tasks.pop(cid, None)
+        def _cleanup(_task, conversation_id=conversation_id):
+            runtime.processing_tasks.pop(conversation_id, None)
 
         task.add_done_callback(_cleanup)
 

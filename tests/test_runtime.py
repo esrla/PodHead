@@ -61,8 +61,8 @@ def _config(maximum_concurrent_conversations: int = 2) -> AppConfig:
 
 
 
-def _conn(path=":memory:"):
-    conn = sqlite3.connect(path, check_same_thread=False)
+def _conn(path: str | None = None):
+    conn = sqlite3.connect(path or ":memory:", check_same_thread=False)
     db.init_db(conn)
     return conn
 
