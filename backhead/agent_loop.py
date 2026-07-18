@@ -1,16 +1,12 @@
-"""Agent loop: stateful Agent class and generic create_agent() constructor."""
+"""Agent loop and conversation-history conversion helpers."""
 
 from __future__ import annotations
 
 import json
 from typing import Any
 
-# Path to the workspace guide injected as a system instruction each turn.
-# The file lives inside the container; change this to relocate the guide.
 AGENT_WORKSPACE_GUIDE = "/workspace/AGENT.md"
-
-# Default system prompt used when constructing email agents.
-# Backend security rules are defined here; they must not be editable by the model.
+HISTORY_SEPARATOR = "\n\n---\n\n"
 DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful AI assistant running inside PodHead. "
     f"At the start of each session read {AGENT_WORKSPACE_GUIDE} for workspace instructions. "
@@ -18,30 +14,52 @@ DEFAULT_SYSTEM_PROMPT = (
 )
 
 
-def history_to_openai_messages(history_rows: list[dict]) -> list[dict]:
-    """Convert database message rows to OpenAI chat-completion message dicts.
+def tool_error_result(
+    error_type: str,
+    message: str,
+    details: str | None = None,
+) -> dict[str, Any]:
+    """Return a structured tool-error payload for the agent."""
+    return {
+        "ok": False,
+        "error": {
+            "type": error_type,
+            "message": message,
+            "details": details or "",
+        },
+    }
 
-    Only ``incoming`` (user) and ``outgoing`` (assistant) directions are
-    handled; other row types are silently skipped.
+
+def history_to_openai_messages(history_rows: list[dict]) -> list[dict]:
+    """Convert ordered database rows to OpenAI messages.
+
+    Consecutive messages with the same role are collapsed into one message and
+    separated with ``\n\n---\n\n``.
     """
-    messages: list[dict] = []
+    messages: list[dict[str, str]] = []
     for row in history_rows:
         direction = row.get("direction")
         content = row.get("content", "")
         if direction == "incoming":
-            messages.append({"role": "user", "content": content})
+            role = "user"
         elif direction == "outgoing":
-            messages.append({"role": "assistant", "content": content})
+            role = "assistant"
+        else:
+            continue
+
+        if messages and messages[-1]["role"] == role:
+            previous = messages[-1].get("content") or ""
+            messages[-1]["content"] = (
+                f"{previous}{HISTORY_SEPARATOR}{content}" if previous else content
+            )
+            continue
+
+        messages.append({"role": role, "content": content})
     return messages
 
 
 class Agent:
-    """Stateful conversation context bound to one set of backend dependencies.
-
-    Each instance owns its own ``conversation_history``.  Separate instances
-    never share history.  The official OpenAI client is stored as
-    ``self.openai_client`` so callers can inspect or replace it.
-    """
+    """Stateful conversation context bound to one set of backend dependencies."""
 
     def __init__(
         self,
@@ -67,31 +85,32 @@ class Agent:
         self.depth = depth
         self.max_depth = max_depth
         self.max_children = max_children
-        self._children_spawned: int = 0
+        self._children_spawned = 0
+
+    def _append_tool_result(self, tool_call_id: str, result: Any) -> None:
+        if isinstance(result, (dict, list)):
+            content = json.dumps(result)
+        else:
+            content = str(result)
+        self.conversation_history.append(
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": content,
+            }
+        )
 
     def run(self, prompt: str) -> str:
-        """Append *prompt* as a user message and run the agent loop to completion.
-
-        The loop:
-        1. Appends the prompt as a user message.
-        2. Calls ``self.openai_client.chat.completions.create(...)`` with the
-           system prompt, current history, and available tool schemas.
-        3. Appends the assistant response to ``self.conversation_history``.
-        4. If the response contains tool calls, executes each handler and
-           appends the results in valid OpenAI tool-result format.
-        5. Repeats until the model returns a final text response.
-        6. Returns the final response text.
-        """
+        """Append *prompt* as a user message and run the agent loop to completion."""
         self.conversation_history.append({"role": "user", "content": prompt})
 
         while True:
-            messages = [
-                {"role": "system", "content": self.system_prompt},
-                *self.conversation_history,
-            ]
             kwargs: dict[str, Any] = {
                 "model": self.model,
-                "messages": messages,
+                "messages": [
+                    {"role": "system", "content": self.system_prompt},
+                    *self.conversation_history,
+                ],
             }
             if self.tools:
                 kwargs["tools"] = self.tools
@@ -101,7 +120,6 @@ class Agent:
             choice = response.choices[0]
             msg = choice.message
 
-            # Build the assistant turn to persist.
             assistant_turn: dict[str, Any] = {
                 "role": "assistant",
                 "content": msg.content,
@@ -120,65 +138,49 @@ class Agent:
                 ]
             self.conversation_history.append(assistant_turn)
 
-            # No tool calls → final text response.
             if not msg.tool_calls:
                 return msg.content or ""
 
-            # Execute each tool call and append results.
             for tc in msg.tool_calls:
                 tool_name = tc.function.name
-                try:
-                    args = json.loads(tc.function.arguments)
-                except json.JSONDecodeError:
-                    args = {}
                 handler = self.tool_handlers.get(tool_name)
                 if handler is None:
-                    result = f"Error: unknown tool '{tool_name}'"
-                else:
-                    try:
-                        result = handler(args, self)
-                    except Exception as exc:  # noqa: BLE001
-                        result = f"Error in tool '{tool_name}': {exc}"
-                self.conversation_history.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": str(result),
-                    }
-                )
+                    self._append_tool_result(
+                        tc.id,
+                        tool_error_result(
+                            "tool_execution_error",
+                            f"Unknown tool '{tool_name}'.",
+                            "No backend handler is registered for this tool.",
+                        ),
+                    )
+                    continue
 
+                try:
+                    args = json.loads(tc.function.arguments)
+                except json.JSONDecodeError as exc:
+                    self._append_tool_result(
+                        tc.id,
+                        tool_error_result(
+                            "tool_execution_error",
+                            "Invalid JSON arguments.",
+                            str(exc),
+                        ),
+                    )
+                    continue
 
-def create_agent(
-    *,
-    openai_client: Any,
-    model: str,
-    system_prompt: str,
-    conversation_history: list[dict] | None = None,
-    tools: list[dict],
-    tool_handlers: dict[str, Any],
-    container_runner: Any,
-    depth: int = 0,
-    max_depth: int = 2,
-    max_children: int = 4,
-) -> Agent:
-    """Generic backend helper for constructing an Agent instance.
-
-    Both ``main.py`` (email-triggered agents) and ``spawn_subagent`` (child
-    agents) must create agents through this single function so that the same
-    construction path is always used.
-
-    The caller supplies all concrete runtime dependencies; ``create_agent``
-    does not assume a shared client, model, or tool set.
-    """
-    return Agent(
-        openai_client=openai_client,
-        model=model,
-        system_prompt=system_prompt,
-        conversation_history=conversation_history,
-        tools=tools,
-        tool_handlers=tool_handlers,
-        container_runner=container_runner,
-        depth=depth,
-        max_depth=max_depth,
-        max_children=max_children,
-    )
+                try:
+                    result = handler(args, self)
+                except TimeoutError as exc:
+                    result = tool_error_result(
+                        "tool_execution_error",
+                        "Tool timed out.",
+                        str(exc),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    error_type = getattr(exc, "error_type", "tool_execution_error")
+                    result = tool_error_result(
+                        error_type,
+                        "Tool execution failed.",
+                        str(exc),
+                    )
+                self._append_tool_result(tc.id, result)
