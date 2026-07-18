@@ -1,10 +1,14 @@
-"""Mail parsing and conversation routing helpers."""
+"""Mail parsing, routing, IMAP polling, and SMTP sending helpers."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from email.utils import make_msgid, parseaddr
+from email import message_from_bytes, policy
+from email.message import EmailMessage, Message
+from email.utils import formataddr, make_msgid, parseaddr
+import imaplib
 import re
+import smtplib
 from typing import Callable
 
 from backhead import db
@@ -14,8 +18,6 @@ MESSAGE_ID_PATTERN = re.compile(r"<[^<>]+>")
 
 @dataclass(frozen=True)
 class IncomingEmail:
-    """Canonical incoming email payload used by the backend."""
-
     from_header: str
     subject: str
     body: str
@@ -27,23 +29,47 @@ class IncomingEmail:
 
 @dataclass(frozen=True)
 class OutgoingEmail:
-    """Outgoing reply payload that can be delivered by SMTP backend."""
-
     to: str
+    from_address: str
     subject: str
     body: str
     headers: dict[str, str]
 
 
+class SMTPDeliveryError(RuntimeError):
+    error_type = "smtp_delivery_error"
+
+
+class IMAPPollError(RuntimeError):
+    error_type = "imap_poll_error"
+
+
+class SMTPConfigProtocol:
+    host: str
+    port: int
+    username: str
+    password: str
+    use_tls: bool
+
+
+class IMAPConfigProtocol:
+    host: str
+    port: int
+    username: str
+    password: str
+    inbox: str
+    use_ssl: bool
+
+
+
 def normalize_sender(from_header: str) -> str | None:
-    """Normalize sender using parsed address from From header."""
     _, address = parseaddr(from_header or "")
     normalized = (address or "").strip().lower()
     return normalized or None
 
 
+
 def normalize_message_id(value: str | None) -> str | None:
-    """Normalize Message-ID/In-Reply-To values into canonical '<id@host>' form."""
     normalized: str | None = None
     if value:
         raw = value.strip()
@@ -56,21 +82,56 @@ def normalize_message_id(value: str | None) -> str | None:
     return normalized
 
 
+
 def normalize_references(value: str | None) -> list[str]:
-    """Parse and normalize References header into oldest->newest message ids."""
     if not value:
         return []
-    refs = [m.group(0).strip().lower() for m in MESSAGE_ID_PATTERN.finditer(value)]
-    return refs
+    return [m.group(0).strip().lower() for m in MESSAGE_ID_PATTERN.finditer(value)]
+
+
+
+def parse_mime_message(raw_message: bytes) -> IncomingEmail:
+    parsed = message_from_bytes(raw_message, policy=policy.default)
+    return IncomingEmail(
+        from_header=parsed.get("From", ""),
+        subject=parsed.get("Subject", ""),
+        body=_extract_text_body(parsed),
+        message_id=parsed.get("Message-ID"),
+        in_reply_to=parsed.get("In-Reply-To"),
+        references=parsed.get("References"),
+        timestamp=None,
+    )
+
+
+
+def _extract_text_body(message: Message) -> str:
+    if message.is_multipart():
+        text_parts: list[str] = []
+        for part in message.walk():
+            if part.get_content_maintype() == "multipart":
+                continue
+            if part.get_content_disposition() == "attachment":
+                continue
+            if part.get_content_type() == "text/plain":
+                text_parts.append(part.get_content())
+        if text_parts:
+            return "\n\n".join(part.strip() for part in text_parts if part.strip())
+        for part in message.walk():
+            if part.get_content_type() == "text/html":
+                return part.get_content().strip()
+        return ""
+    content = message.get_content()
+    return content.strip() if isinstance(content, str) else ""
+
 
 
 def _subject_for_reply(subject: str) -> str:
     if not subject:
         return "Re: (no subject)"
-    lowered = subject.lower().strip()
-    if lowered.startswith("re:"):
+    if subject.lower().strip().startswith("re:"):
         return subject
     return f"Re: {subject}"
+
 
 
 def _build_references_header(existing_refs: list[str], incoming_message_id: str | None) -> str | None:
@@ -80,6 +141,7 @@ def _build_references_header(existing_refs: list[str], incoming_message_id: str 
     if not refs:
         return None
     return " ".join(refs)
+
 
 
 def _build_outgoing_headers(
@@ -100,16 +162,13 @@ def _build_outgoing_headers(
     return outgoing_message_id, headers
 
 
-def process_incoming_email(
+
+def store_incoming_email(
     *,
     conn,
     incoming: IncomingEmail,
     whitelist: set[str] | list[str],
-    run_agent: Callable[[list[dict], IncomingEmail], str],
-    send_reply: Callable[[OutgoingEmail], None],
-    generated_message_id: str | None = None,
 ) -> dict:
-    """Process one incoming email into one routed conversation turn."""
     sender = normalize_sender(incoming.from_header)
     normalized_whitelist = {s.strip().lower() for s in whitelist}
     if not sender or sender not in normalized_whitelist:
@@ -135,46 +194,155 @@ def process_incoming_email(
             created_ts=incoming.timestamp,
         )
 
-    db.insert_message(
+    message_row_id = db.insert_message(
         conn,
         conversation_id=conversation_id,
         email_message_id=incoming_message_id,
         direction="incoming",
         content=incoming.body,
+        subject=incoming.subject,
         timestamp=incoming.timestamp,
         in_reply_to=in_reply_to,
         references_header=" ".join(references) if references else None,
+        process_state=db.PENDING,
     )
 
-    history = db.get_conversation_history(conn, conversation_id)
-    assistant_text = run_agent(history, incoming)
+    return {
+        "status": "queued",
+        "sender": sender,
+        "conversation_id": conversation_id,
+        "incoming_message_id": incoming_message_id,
+        "message_row_id": message_row_id,
+    }
 
+
+
+def build_reply_email(
+    *,
+    from_address: str,
+    incoming: IncomingEmail,
+    to: str,
+    body: str,
+    generated_message_id: str | None = None,
+) -> tuple[OutgoingEmail, str]:
+    incoming_message_id = normalize_message_id(incoming.message_id)
+    references = normalize_references(incoming.references)
     outgoing_message_id, headers = _build_outgoing_headers(
         incoming_message_id=incoming_message_id,
         references=references,
         generated_message_id=generated_message_id,
     )
-
-    db.insert_message(
-        conn,
-        conversation_id=conversation_id,
-        email_message_id=outgoing_message_id,
-        direction="outgoing",
-        content=assistant_text,
-    )
-
-    send_reply(
+    return (
         OutgoingEmail(
-            to=sender,
+            to=to,
+            from_address=from_address,
             subject=_subject_for_reply(incoming.subject),
-            body=assistant_text,
+            body=body,
             headers=headers,
-        )
+        ),
+        outgoing_message_id,
     )
-    return {
-        "status": "processed",
-        "sender": sender,
-        "conversation_id": conversation_id,
-        "incoming_message_id": incoming_message_id,
-        "outgoing_message_id": outgoing_message_id,
-    }
+
+
+
+def send_reply_smtp(outgoing: OutgoingEmail, smtp_config: SMTPConfigProtocol) -> None:
+    message = EmailMessage()
+    message["From"] = formataddr(("PodHead", outgoing.from_address))
+    message["To"] = outgoing.to
+    message["Subject"] = outgoing.subject
+    for key, value in outgoing.headers.items():
+        message[key] = value
+    message.set_content(outgoing.body)
+
+    try:
+        with smtplib.SMTP(smtp_config.host, smtp_config.port, timeout=30) as smtp:
+            if smtp_config.use_tls:
+                smtp.starttls()
+            smtp.login(smtp_config.username, smtp_config.password)
+            smtp.send_message(message)
+    except Exception as exc:  # noqa: BLE001
+        raise SMTPDeliveryError(str(exc)) from exc
+
+
+
+def _open_imap_connection(imap_config: IMAPConfigProtocol):
+    if imap_config.use_ssl:
+        return imaplib.IMAP4_SSL(imap_config.host, imap_config.port)
+    return imaplib.IMAP4(imap_config.host, imap_config.port)
+
+
+
+def poll_inbox(*, conn, whitelist: set[str] | list[str], imap_config: IMAPConfigProtocol) -> list[dict]:
+    try:
+        with _open_imap_connection(imap_config) as client:
+            client.login(imap_config.username, imap_config.password)
+            status, _ = client.select(imap_config.inbox)
+            if status != "OK":
+                raise IMAPPollError(f"Failed to select inbox {imap_config.inbox!r}")
+
+            status, data = client.search(None, "ALL")
+            if status != "OK":
+                raise IMAPPollError("Failed to search inbox")
+
+            results: list[dict] = []
+            for raw_id in data[0].split():
+                status, fetched = client.fetch(raw_id, "(RFC822)")
+                if status != "OK" or not fetched or fetched[0] is None:
+                    continue
+                payload = fetched[0][1]
+                if not isinstance(payload, (bytes, bytearray)):
+                    continue
+                incoming = parse_mime_message(bytes(payload))
+                result = store_incoming_email(conn=conn, incoming=incoming, whitelist=whitelist)
+                results.append(result)
+                client.store(raw_id, "+FLAGS", "\\Seen")
+            return results
+    except IMAPPollError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise IMAPPollError(str(exc)) from exc
+
+
+
+def process_incoming_email(
+    *,
+    conn,
+    incoming: IncomingEmail,
+    whitelist: set[str] | list[str],
+    run_agent: Callable[[list[dict], IncomingEmail], str],
+    send_reply: Callable[[OutgoingEmail], None],
+    generated_message_id: str | None = None,
+    from_address: str = "podhead@example.com",
+) -> dict:
+    result = store_incoming_email(conn=conn, incoming=incoming, whitelist=whitelist)
+    if result["status"] != "queued":
+        return result
+
+    history = db.get_conversation_history(conn, result["conversation_id"])
+    db.update_message_state(conn, result["message_row_id"], db.PROCESSING)
+    try:
+        assistant_text = run_agent(history, incoming)
+        outgoing, outgoing_message_id = build_reply_email(
+            from_address=from_address,
+            incoming=incoming,
+            to=result["sender"],
+            body=assistant_text,
+            generated_message_id=generated_message_id,
+        )
+        send_reply(outgoing)
+        db.insert_message(
+            conn,
+            conversation_id=result["conversation_id"],
+            email_message_id=outgoing_message_id,
+            direction="outgoing",
+            content=assistant_text,
+            process_state=db.COMPLETED,
+        )
+        db.update_message_state(conn, result["message_row_id"], db.COMPLETED)
+    except Exception as exc:  # noqa: BLE001
+        db.update_message_state(conn, result["message_row_id"], db.FAILED, str(exc))
+        raise
+
+    result["status"] = "processed"
+    result["outgoing_message_id"] = outgoing_message_id
+    return result

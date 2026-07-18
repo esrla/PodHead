@@ -1,13 +1,10 @@
-"""Backend tool: run_cli.
-
-Exposes a CLI execution tool that runs commands inside the shared Podman
-container.  The actual execution boundary is an injected ``container_runner``
-callable, so tests can supply a fake without a running container.
-"""
+"""Backend tool: run_cli."""
 
 from __future__ import annotations
 
 from typing import Any
+
+from backhead.agent_loop import tool_error_result
 
 CLI_TOOL_SCHEMA: dict[str, Any] = {
     "type": "function",
@@ -33,18 +30,23 @@ CLI_TOOL_SCHEMA: dict[str, Any] = {
 
 
 def create_cli_tool(container_runner: Any) -> tuple[dict, Any]:
-    """Return ``(schema, handler)`` for the ``run_cli`` tool.
-
-    ``container_runner`` is the injected callable that performs actual
-    execution.  Its signature is ``container_runner(command: str) -> str``.
-    Tests pass a fake; production code passes the real Podman runner.
-
-    The handler signature is ``handler(args, calling_agent)`` to match the
-    convention used by all backend tool handlers.
-    """
-
-    def handler(args: dict, calling_agent: Any) -> str:
-        command = args.get("command", "")
-        return container_runner(command)
+    def handler(args: dict, calling_agent: Any) -> str | dict:
+        command = args.get("command")
+        if not isinstance(command, str) or not command.strip():
+            return tool_error_result(
+                "tool_execution_error",
+                "Missing or invalid parameter.",
+                "Expected a non-empty string in args['command'].",
+            )
+        try:
+            return {"ok": True, "output": container_runner(command)}
+        except TimeoutError as exc:
+            return tool_error_result("tool_execution_error", "Command timed out.", str(exc))
+        except Exception as exc:  # noqa: BLE001
+            return tool_error_result(
+                getattr(exc, "error_type", "tool_execution_error"),
+                "Command failed.",
+                str(exc),
+            )
 
     return CLI_TOOL_SCHEMA, handler

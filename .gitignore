@@ -1,2 +1,4 @@
-**/private.json
 **/.embed.npy
+state/
+__pycache__/
+.pytest_cache/

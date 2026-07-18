@@ -1,35 +1,23 @@
-"""Unit tests for Agent, create_agent, history conversion, spawn_subagent,
-and the email-agent construction flow.
-
-All tests use fake OpenAI clients; no running llama.cpp server is required.
-"""
+"""Unit tests for Agent construction, history conversion, and subagents."""
 
 from __future__ import annotations
 
 import json
 import sqlite3
-from typing import Any
 from unittest.mock import MagicMock
 
-import pytest
-
 from backhead import db
-from backhead.agent_loop import Agent, create_agent, history_to_openai_messages
-from backhead.mail import IncomingEmail, process_incoming_email
+from backhead.agent_loop import Agent, HISTORY_SEPARATOR, history_to_openai_messages
+from backhead.main import build_email_agent_runner
 from backhead.tools.spawn_subagent import SPAWN_SUBAGENT_SCHEMA, create_spawn_subagent_tool
-from main import build_email_agent_runner
 
-
-# ---------------------------------------------------------------------------
-# Fake OpenAI client helpers
-# ---------------------------------------------------------------------------
 
 class _FakeToolCall:
     def __init__(self, call_id, name, arguments):
         self.id = call_id
-        self.function = MagicMock(name=name, arguments=json.dumps(arguments))
+        self.function = MagicMock()
         self.function.name = name
-        self.function.arguments = json.dumps(arguments)
+        self.function.arguments = arguments
 
 
 class _FakeMessage:
@@ -39,632 +27,249 @@ class _FakeMessage:
 
 
 class _FakeChoice:
-    def __init__(self, content, tool_calls=None, finish_reason="stop"):
+    def __init__(self, content, tool_calls=None):
         self.message = _FakeMessage(content, tool_calls)
-        self.finish_reason = finish_reason
 
 
 class _FakeResponse:
-    def __init__(self, content, tool_calls=None, finish_reason="stop"):
-        self.choices = [_FakeChoice(content, tool_calls, finish_reason)]
+    def __init__(self, content, tool_calls=None):
+        self.choices = [_FakeChoice(content, tool_calls)]
 
 
 class _FakeCompletions:
     def __init__(self, responses):
         self._responses = list(responses)
         self._index = 0
-        self.calls: list[dict] = []
+        self.calls = []
 
     def create(self, **kwargs):
         self.calls.append(kwargs)
-        resp = self._responses[self._index]
+        response = self._responses[self._index]
         self._index += 1
-        return resp
+        return response
+
 
 
 def _fake_client(*responses):
-    """Return a fake OpenAI client that yields the given responses in order."""
     client = MagicMock()
     completions = _FakeCompletions(responses)
     client.chat.completions = completions
     return client, completions
 
 
-# ---------------------------------------------------------------------------
-# 1. One Agent instance owns its own conversation history
-# ---------------------------------------------------------------------------
 
-def test_agent_owns_its_own_history():
-    client, completions = _fake_client(_FakeResponse("Hello!"))
-    agent = create_agent(
+def test_agent_is_constructed_directly_and_owns_its_history():
+    client, _ = _fake_client(_FakeResponse("Hello"))
+    agent = Agent(openai_client=client, model="main-model", system_prompt="sys")
+    result = agent.run("Hi")
+    assert result == "Hello"
+    assert agent.conversation_history == [
+        {"role": "user", "content": "Hi"},
+        {"role": "assistant", "content": "Hello"},
+    ]
+
+
+
+def test_history_to_openai_messages_collapses_consecutive_roles():
+    rows = [
+        {"direction": "incoming", "content": "one"},
+        {"direction": "incoming", "content": "two"},
+        {"direction": "outgoing", "content": "three"},
+        {"direction": "outgoing", "content": "four"},
+    ]
+    assert history_to_openai_messages(rows) == [
+        {"role": "user", "content": f"one{HISTORY_SEPARATOR}two"},
+        {"role": "assistant", "content": f"three{HISTORY_SEPARATOR}four"},
+    ]
+
+
+
+def test_main_agent_history_is_loaded_from_database_without_duplication():
+    conn = sqlite3.connect(":memory:")
+    db.init_db(conn)
+    conversation_id = db.create_conversation(conn, "alice@example.com", created_ts=1)
+    db.insert_message(
+        conn,
+        conversation_id=conversation_id,
+        email_message_id="<old-in@example.com>",
+        direction="incoming",
+        content="First user message",
+        subject="Hello",
+        timestamp=1,
+        process_state=db.COMPLETED,
+    )
+    db.insert_message(
+        conn,
+        conversation_id=conversation_id,
+        email_message_id="<old-out@example.com>",
+        direction="outgoing",
+        content="First assistant message",
+        subject="Re: Hello",
+        timestamp=2,
+        process_state=db.COMPLETED,
+    )
+    current_id = db.insert_message(
+        conn,
+        conversation_id=conversation_id,
+        email_message_id="<new-in@example.com>",
+        direction="incoming",
+        content="Newest email",
+        subject="Hello again",
+        timestamp=3,
+        process_state=db.PENDING,
+    )
+
+    client, completions = _fake_client(_FakeResponse("Reply"))
+    runner = build_email_agent_runner(
         openai_client=client,
-        model="m",
+        model="main-model",
         system_prompt="sys",
         tools=[],
         tool_handlers={},
         container_runner=None,
+        max_depth=2,
+        max_children=4,
     )
-    agent.run("Hi")
-    assert len(agent.conversation_history) == 2  # user + assistant
+    history = db.get_conversation_history(conn, conversation_id)
+    current_row = db.get_message(conn, current_id)
+
+    assert runner(history, current_row) == "Reply"
+    messages = completions.calls[0]["messages"]
+    user_contents = [message["content"] for message in messages if message["role"] == "user"]
+    assert user_contents == ["First user message", "Newest email"]
 
 
-# ---------------------------------------------------------------------------
-# 2. Separate Agent instances do not share history
-# ---------------------------------------------------------------------------
 
-def test_separate_agents_do_not_share_history():
-    c1, _ = _fake_client(_FakeResponse("A"))
-    c2, _ = _fake_client(_FakeResponse("B"))
-    a1 = create_agent(openai_client=c1, model="m", system_prompt="s",
-                      tools=[], tool_handlers={}, container_runner=None)
-    a2 = create_agent(openai_client=c2, model="m", system_prompt="s",
-                      tools=[], tool_handlers={}, container_runner=None)
-    a1.run("first")
-    assert a2.conversation_history == []
+def test_spawn_subagent_starts_fresh_history_and_uses_configured_model():
+    sub_client, completions = _fake_client(_FakeResponse("child done"))
+    _, handler = create_spawn_subagent_tool(
+        openai_client=sub_client,
+        model="sub-model",
+        system_prompt="sub-system",
+        tools=[],
+        tool_handlers={},
+        container_runner=None,
+        max_depth=2,
+        max_children=4,
+    )
+    parent = Agent(
+        openai_client=MagicMock(),
+        model="parent-model",
+        system_prompt="parent-system",
+        conversation_history=[{"role": "user", "content": "parent history"}],
+    )
+
+    result = handler({"prompt": "subtask"}, parent)
+    assert result == {"ok": True, "response": "child done"}
+    assert completions.calls[0]["model"] == "sub-model"
+    assert [m["content"] for m in completions.calls[0]["messages"] if m["role"] == "user"] == ["subtask"]
 
 
-# ---------------------------------------------------------------------------
-# 3. The official-style client is stored as self.openai_client
-# ---------------------------------------------------------------------------
 
-def test_openai_client_stored_as_attribute():
-    sentinel = object()
+def test_subagents_can_call_spawn_subagent_recursively():
+    sub_client, completions = _fake_client(
+        _FakeResponse(None, [_FakeToolCall("outer", "spawn_subagent", json.dumps({"prompt": "inner"}))]),
+        _FakeResponse("inner complete"),
+        _FakeResponse("outer complete"),
+    )
+    sub_tools: list[dict] = []
+    sub_handlers: dict[str, object] = {}
+    schema, handler = create_spawn_subagent_tool(
+        openai_client=sub_client,
+        model="sub-model",
+        system_prompt="sub-system",
+        tools=sub_tools,
+        tool_handlers=sub_handlers,
+        container_runner=None,
+        max_depth=3,
+        max_children=4,
+    )
+    sub_tools.append(schema)
+    sub_handlers["spawn_subagent"] = handler
+
+    parent = Agent(openai_client=MagicMock(), model="parent-model", system_prompt="parent-system")
+    result = handler({"prompt": "outer"}, parent)
+    assert result == {"ok": True, "response": "outer complete"}
+    assert len(completions.calls) == 3
+
+
+
+def test_spawn_limits_are_enforced():
+    sub_client = MagicMock()
+    _, handler = create_spawn_subagent_tool(
+        openai_client=sub_client,
+        model="sub-model",
+        system_prompt="sub-system",
+        tools=[],
+        tool_handlers={},
+        container_runner=None,
+        max_depth=1,
+        max_children=1,
+    )
+
+    depth_limited_parent = Agent(openai_client=MagicMock(), model="m", system_prompt="s", depth=1, max_depth=1)
+    depth_result = handler({"prompt": "nope"}, depth_limited_parent)
+    assert depth_result["ok"] is False
+    assert "depth" in depth_result["error"]["message"].lower()
+
+    child_limited_parent = Agent(openai_client=MagicMock(), model="m", system_prompt="s", max_children=1)
+    child_limited_parent._children_spawned = 1
+    child_result = handler({"prompt": "nope"}, child_limited_parent)
+    assert child_result["ok"] is False
+    assert "child count" in child_result["error"]["message"].lower()
+
+
+
+def test_main_and_subagent_can_use_different_clients_and_models():
+    main_client, main_completions = _fake_client(_FakeResponse("main done"))
+    sub_client, sub_completions = _fake_client(_FakeResponse("sub done"))
+
+    _, handler = create_spawn_subagent_tool(
+        openai_client=sub_client,
+        model="sub-model",
+        system_prompt="sub-system",
+        tools=[],
+        tool_handlers={},
+        container_runner=None,
+    )
+    parent = Agent(openai_client=main_client, model="main-model", system_prompt="main-system")
+
+    assert parent.run("top level") == "main done"
+    assert handler({"prompt": "delegate"}, parent) == {"ok": True, "response": "sub done"}
+    assert main_completions.calls[0]["model"] == "main-model"
+    assert sub_completions.calls[0]["model"] == "sub-model"
+
+
+
+def test_tool_errors_are_returned_as_tool_messages_and_loop_continues():
+    client, _ = _fake_client(
+        _FakeResponse(None, [_FakeToolCall("call-1", "broken", "{not-json")]),
+        _FakeResponse(None, [_FakeToolCall("call-2", "broken", json.dumps({}))]),
+        _FakeResponse("recovered"),
+    )
+
+    def broken_handler(args, calling_agent):
+        raise RuntimeError("should not run for invalid args")
+
     agent = Agent(
-        openai_client=sentinel,
-        model="m",
-        system_prompt="s",
-    )
-    assert agent.openai_client is sentinel
-
-
-# ---------------------------------------------------------------------------
-# 4. The configured model is used in API calls
-# ---------------------------------------------------------------------------
-
-def test_configured_model_used_in_api_call():
-    client, completions = _fake_client(_FakeResponse("ok"))
-    agent = create_agent(
         openai_client=client,
-        model="my-special-model",
-        system_prompt="s",
-        tools=[],
-        tool_handlers={},
-        container_runner=None,
-    )
-    agent.run("hello")
-    assert completions.calls[0]["model"] == "my-special-model"
-
-
-# ---------------------------------------------------------------------------
-# 5. An ordinary assistant response is appended and returned
-# ---------------------------------------------------------------------------
-
-def test_ordinary_response_appended_and_returned():
-    client, _ = _fake_client(_FakeResponse("The answer is 42."))
-    agent = create_agent(
-        openai_client=client,
-        model="m",
-        system_prompt="s",
-        tools=[],
-        tool_handlers={},
-        container_runner=None,
-    )
-    result = agent.run("What is the answer?")
-    assert result == "The answer is 42."
-    assert agent.conversation_history[-1] == {
-        "role": "assistant",
-        "content": "The answer is 42.",
-    }
-
-
-# ---------------------------------------------------------------------------
-# 6. Tool calls and tool results are appended in valid order
-# ---------------------------------------------------------------------------
-
-def test_tool_call_and_result_appended_in_order():
-    tc = _FakeToolCall("call-1", "echo", {"text": "hi"})
-    client, completions = _fake_client(
-        _FakeResponse(None, tool_calls=[tc], finish_reason="tool_calls"),
-        _FakeResponse("Done."),
-    )
-
-    def echo_handler(args, calling_agent):
-        return args["text"]
-
-    agent = create_agent(
-        openai_client=client,
-        model="m",
-        system_prompt="s",
-        tools=[{"type": "function", "function": {"name": "echo"}}],
-        tool_handlers={"echo": echo_handler},
-        container_runner=None,
-    )
-    result = agent.run("echo hi")
-    assert result == "Done."
-    roles = [m["role"] for m in agent.conversation_history]
-    assert roles == ["user", "assistant", "tool", "assistant"]
-    tool_msg = agent.conversation_history[2]
-    assert tool_msg["role"] == "tool"
-    assert tool_msg["tool_call_id"] == "call-1"
-    assert tool_msg["content"] == "hi"
-
-
-# ---------------------------------------------------------------------------
-# 7. Email history is converted correctly
-# ---------------------------------------------------------------------------
-
-def test_history_to_openai_messages_conversion():
-    rows = [
-        {"direction": "incoming", "content": "Hello"},
-        {"direction": "outgoing", "content": "Hi there"},
-        {"direction": "incoming", "content": "How are you?"},
-    ]
-    messages = history_to_openai_messages(rows)
-    assert messages == [
-        {"role": "user", "content": "Hello"},
-        {"role": "assistant", "content": "Hi there"},
-        {"role": "user", "content": "How are you?"},
-    ]
-
-
-def test_history_conversion_skips_unknown_directions():
-    rows = [
-        {"direction": "incoming", "content": "msg"},
-        {"direction": "unknown", "content": "should skip"},
-    ]
-    messages = history_to_openai_messages(rows)
-    assert len(messages) == 1
-    assert messages[0]["role"] == "user"
-
-
-# ---------------------------------------------------------------------------
-# 8. The current incoming email is not duplicated in the agent context
-# ---------------------------------------------------------------------------
-
-def test_current_incoming_email_not_duplicated():
-    """The newest incoming row is already in history; run_agent must not add it again."""
-    conn = sqlite3.connect(":memory:")
-    db.init_db(conn)
-    captured_messages: list[list[dict]] = []
-
-    def capturing_client_factory():
-        client = MagicMock()
-
-        def fake_create(**kwargs):
-            captured_messages.append(list(kwargs["messages"]))
-            return _FakeResponse("Reply")
-
-        client.chat.completions.create = fake_create
-        return client
-
-    client = capturing_client_factory()
-    runner = build_email_agent_runner(
-        openai_client=client,
-        model="m",
+        model="model",
         system_prompt="sys",
-        tools=[],
-        tool_handlers={},
-        container_runner=None,
-        max_depth=2,
-        max_children=4,
+        tools=[{"type": "function", "function": {"name": "broken"}}],
+        tool_handlers={"broken": broken_handler},
     )
 
-    process_incoming_email(
-        conn=conn,
-        incoming=IncomingEmail(
-            from_header="alice@example.com",
-            subject="Hi",
-            body="Hello agent",
-            message_id="<m1@example.com>",
-        ),
-        whitelist={"alice@example.com"},
-        run_agent=runner,
-        send_reply=lambda _: None,
-    )
-
-    # There should be exactly one user message with content "Hello agent"
-    assert len(captured_messages) == 1
-    user_contents = [
-        m["content"] for m in captured_messages[0] if m["role"] == "user"
-    ]
-    assert user_contents.count("Hello agent") == 1
+    assert agent.run("go") == "recovered"
+    tool_messages = [message for message in agent.conversation_history if message["role"] == "tool"]
+    assert [message["tool_call_id"] for message in tool_messages] == ["call-1", "call-2"]
+    first = json.loads(tool_messages[0]["content"])
+    assert first["ok"] is False
+    assert first["error"]["type"] == "tool_execution_error"
 
 
-# ---------------------------------------------------------------------------
-# 9. main.py / build_email_agent_runner constructs agents through create_agent
-# ---------------------------------------------------------------------------
-
-def test_email_agent_runner_calls_create_agent(monkeypatch):
-    created: list[Agent] = []
-    original_create_agent = create_agent
-
-    def recording_create_agent(**kwargs):
-        agent = original_create_agent(**kwargs)
-        created.append(agent)
-        return agent
-
-    import main as main_module
-    monkeypatch.setattr(main_module, "create_agent", recording_create_agent)
-
-    client = MagicMock()
-    client.chat.completions.create.return_value = _FakeResponse("ok")
-
-    runner = build_email_agent_runner(
-        openai_client=client,
-        model="m",
-        system_prompt="s",
-        tools=[],
-        tool_handlers={},
-        container_runner=None,
-        max_depth=2,
-        max_children=4,
-    )
-
-    conn = sqlite3.connect(":memory:")
-    db.init_db(conn)
-    process_incoming_email(
-        conn=conn,
-        incoming=IncomingEmail(
-            from_header="alice@example.com",
-            subject="Hi",
-            body="test",
-            message_id="<t1@example.com>",
-        ),
-        whitelist={"alice@example.com"},
-        run_agent=runner,
-        send_reply=lambda _: None,
-    )
-    assert len(created) == 1
-
-
-# ---------------------------------------------------------------------------
-# 10. spawn_subagent also constructs agents through create_agent
-# ---------------------------------------------------------------------------
-
-def test_spawn_subagent_uses_create_agent(monkeypatch):
-    import backhead.tools.spawn_subagent as ss_module
-
-    created: list[Agent] = []
-    original = ss_module.create_agent
-
-    def recording(**kwargs):
-        agent = original(**kwargs)
-        created.append(agent)
-        return agent
-
-    monkeypatch.setattr(ss_module, "create_agent", recording)
-
-    sub_client = MagicMock()
-    sub_client.chat.completions.create.return_value = _FakeResponse("child done")
-
-    _, spawn_handler = create_spawn_subagent_tool(
-        openai_client=sub_client,
-        model="sub-m",
-        system_prompt="sub-sys",
-        tools=[],
-        tool_handlers={},
-        container_runner=None,
-    )
-
-    parent = Agent(openai_client=MagicMock(), model="p", system_prompt="ps")
-    result = spawn_handler({"prompt": "do something"}, parent)
-    assert result == "child done"
-    assert len(created) == 1
-
-
-# ---------------------------------------------------------------------------
-# 11. The child starts with fresh conversation history
-# ---------------------------------------------------------------------------
-
-def test_child_starts_with_fresh_history():
-    sub_client = MagicMock()
-    sub_client.chat.completions.create.return_value = _FakeResponse("fresh")
-
-    _, spawn_handler = create_spawn_subagent_tool(
-        openai_client=sub_client,
-        model="sub",
-        system_prompt="sys",
-        tools=[],
-        tool_handlers={},
-        container_runner=None,
-    )
-
-    # Give the parent some history.
-    parent = Agent(
-        openai_client=MagicMock(),
-        model="p",
-        system_prompt="ps",
-        conversation_history=[{"role": "user", "content": "parent msg"}],
-    )
-    spawn_handler({"prompt": "subtask"}, parent)
-
-    # The child's messages sent to the API should not contain parent history.
-    call_kwargs = sub_client.chat.completions.create.call_args[1]
-    user_messages = [m for m in call_kwargs["messages"] if m["role"] == "user"]
-    assert len(user_messages) == 1
-    assert user_messages[0]["content"] == "subtask"
-
-
-# ---------------------------------------------------------------------------
-# 12. The parent history is not copied into the child
-# ---------------------------------------------------------------------------
-
-def test_parent_history_not_copied_to_child():
-    sub_client = MagicMock()
-    sub_client.chat.completions.create.return_value = _FakeResponse("result")
-
-    _, spawn_handler = create_spawn_subagent_tool(
-        openai_client=sub_client,
-        model="sub",
-        system_prompt="sys",
-        tools=[],
-        tool_handlers={},
-        container_runner=None,
-    )
-
-    parent = Agent(
-        openai_client=MagicMock(),
-        model="p",
-        system_prompt="ps",
-        conversation_history=[
-            {"role": "user", "content": "parent-only content"},
-            {"role": "assistant", "content": "parent-only reply"},
-        ],
-    )
-    spawn_handler({"prompt": "new task"}, parent)
-
-    call_kwargs = sub_client.chat.completions.create.call_args[1]
-    all_content = [m.get("content", "") for m in call_kwargs["messages"]]
-    assert "parent-only content" not in all_content
-    assert "parent-only reply" not in all_content
-
-
-# ---------------------------------------------------------------------------
-# 13. The child receives the tool-configured OpenAI client and model
-# ---------------------------------------------------------------------------
-
-def test_child_receives_configured_client_and_model():
-    sub_client = MagicMock()
-    sub_client.chat.completions.create.return_value = _FakeResponse("ok")
-
-    _, spawn_handler = create_spawn_subagent_tool(
-        openai_client=sub_client,
-        model="configured-child-model",
-        system_prompt="sys",
-        tools=[],
-        tool_handlers={},
-        container_runner=None,
-    )
-
-    parent = Agent(openai_client=MagicMock(), model="parent-model", system_prompt="ps")
-    spawn_handler({"prompt": "task"}, parent)
-
-    call_kwargs = sub_client.chat.completions.create.call_args[1]
-    assert call_kwargs["model"] == "configured-child-model"
-    sub_client.chat.completions.create.assert_called_once()
-
-
-# ---------------------------------------------------------------------------
-# 14. The child may use a different OpenAI client from the parent
-# ---------------------------------------------------------------------------
-
-def test_child_uses_different_client_from_parent():
-    parent_client = MagicMock()
-    sub_client = MagicMock()
-    sub_client.chat.completions.create.return_value = _FakeResponse("child")
-
-    _, spawn_handler = create_spawn_subagent_tool(
-        openai_client=sub_client,
-        model="sub",
-        system_prompt="sys",
-        tools=[],
-        tool_handlers={},
-        container_runner=None,
-    )
-
-    parent = Agent(openai_client=parent_client, model="p", system_prompt="ps")
-    spawn_handler({"prompt": "task"}, parent)
-
-    parent_client.chat.completions.create.assert_not_called()
-    sub_client.chat.completions.create.assert_called_once()
-
-
-# ---------------------------------------------------------------------------
-# 15. The child may use a different model from the parent
-# ---------------------------------------------------------------------------
-
-def test_child_uses_different_model_from_parent():
-    sub_client = MagicMock()
-    sub_client.chat.completions.create.return_value = _FakeResponse("ok")
-
-    _, spawn_handler = create_spawn_subagent_tool(
-        openai_client=sub_client,
-        model="child-model",
-        system_prompt="sys",
-        tools=[],
-        tool_handlers={},
-        container_runner=None,
-    )
-
-    parent = Agent(openai_client=MagicMock(), model="parent-model", system_prompt="ps")
-    spawn_handler({"prompt": "task"}, parent)
-
-    call_kwargs = sub_client.chat.completions.create.call_args[1]
-    assert call_kwargs["model"] == "child-model"
-    assert call_kwargs["model"] != "parent-model"
-
-
-# ---------------------------------------------------------------------------
-# 16. Parent and child share the same container runner
-# ---------------------------------------------------------------------------
-
-def test_parent_and_child_share_container_runner():
-    """The same container_runner object must reach both parent and child."""
-    shared_runner = MagicMock(return_value="output")
-
-    sub_client = MagicMock()
-    sub_client.chat.completions.create.return_value = _FakeResponse("done")
-
-    from backhead.tools.cli_tool import create_cli_tool
-
-    cli_schema, cli_handler = create_cli_tool(shared_runner)
-
-    _, spawn_handler = create_spawn_subagent_tool(
-        openai_client=sub_client,
-        model="sub",
-        system_prompt="sys",
-        tools=[cli_schema],
-        tool_handlers={"run_cli": cli_handler},
-        container_runner=shared_runner,
-    )
-
-    parent_client = MagicMock()
-    parent_client.chat.completions.create.return_value = _FakeResponse("parent done")
-    parent = create_agent(
-        openai_client=parent_client,
-        model="p",
-        system_prompt="ps",
-        tools=[cli_schema],
-        tool_handlers={"run_cli": cli_handler},
-        container_runner=shared_runner,
-    )
-
-    # Both parent and child reference the same runner object.
-    assert parent.container_runner is shared_runner
-
-    # The child is created inside spawn_handler with the same runner.
-    # We verify by calling the cli_handler and confirming shared_runner is invoked.
-    cli_handler({"command": "ls"}, parent)
-    shared_runner.assert_called_with("ls")
-
-
-# ---------------------------------------------------------------------------
-# 17. Only "prompt" is exposed in the spawn_subagent tool schema
-# ---------------------------------------------------------------------------
 
 def test_spawn_subagent_schema_only_exposes_prompt():
     params = SPAWN_SUBAGENT_SCHEMA["function"]["parameters"]
     assert set(params["properties"].keys()) == {"prompt"}
     assert params["required"] == ["prompt"]
-    assert params.get("additionalProperties") is False
-
-
-# ---------------------------------------------------------------------------
-# 18. The model cannot provide model, endpoint, API key, or system prompt
-# ---------------------------------------------------------------------------
-
-def test_spawn_subagent_schema_hides_backend_parameters():
-    param_names = set(
-        SPAWN_SUBAGENT_SCHEMA["function"]["parameters"]["properties"].keys()
-    )
-    forbidden = {"model", "endpoint", "api_key", "system_prompt", "base_url"}
-    assert param_names.isdisjoint(forbidden), (
-        f"Schema exposes backend parameters: {param_names & forbidden}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# 19. Maximum spawn depth is enforced
-# ---------------------------------------------------------------------------
-
-def test_maximum_spawn_depth_enforced():
-    sub_client = MagicMock()
-
-    _, spawn_handler = create_spawn_subagent_tool(
-        openai_client=sub_client,
-        model="sub",
-        system_prompt="sys",
-        tools=[],
-        tool_handlers={},
-        container_runner=None,
-        max_depth=2,
-    )
-
-    # Parent already at max depth.
-    parent = Agent(
-        openai_client=MagicMock(),
-        model="p",
-        system_prompt="ps",
-        depth=2,
-        max_depth=2,
-    )
-    result = spawn_handler({"prompt": "too deep"}, parent)
-    assert "depth" in result.lower()
-    sub_client.chat.completions.create.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# 20. Maximum child count is enforced
-# ---------------------------------------------------------------------------
-
-def test_maximum_child_count_enforced():
-    sub_client = MagicMock()
-    sub_client.chat.completions.create.return_value = _FakeResponse("ok")
-
-    _, spawn_handler = create_spawn_subagent_tool(
-        openai_client=sub_client,
-        model="sub",
-        system_prompt="sys",
-        tools=[],
-        tool_handlers={},
-        container_runner=None,
-        max_children=2,
-    )
-
-    parent = Agent(
-        openai_client=MagicMock(),
-        model="p",
-        system_prompt="ps",
-        max_children=2,
-    )
-
-    spawn_handler({"prompt": "child 1"}, parent)
-    spawn_handler({"prompt": "child 2"}, parent)
-    result = spawn_handler({"prompt": "child 3"}, parent)
-
-    assert "child count" in result.lower()
-    assert sub_client.chat.completions.create.call_count == 2
-
-
-# ---------------------------------------------------------------------------
-# 21. Existing email-threading tests still pass (sanity re-run via import)
-# ---------------------------------------------------------------------------
-
-def test_existing_email_threading_unaffected():
-    """Verify that the mail processing path still works as before."""
-    conn = sqlite3.connect(":memory:")
-    db.init_db(conn)
-    sent = []
-    result = process_incoming_email(
-        conn=conn,
-        incoming=IncomingEmail(
-            from_header="alice@example.com",
-            subject="Hello",
-            body="First",
-            message_id="<sanity@example.com>",
-        ),
-        whitelist={"alice@example.com"},
-        run_agent=lambda history, incoming: "Reply",
-        send_reply=sent.append,
-    )
-    assert result["status"] == "processed"
-    assert len(sent) == 1
-
-
-# ---------------------------------------------------------------------------
-# 22. Existing skill-search tests still pass (verified by running the full suite)
-# ---------------------------------------------------------------------------
-# The find_skill tests are in test_find_skill.py and run as part of the suite.
-# A lightweight import check is sufficient here.
-
-def test_find_skill_module_importable():
-    """Sanity check: the find_skill module can be imported from the workspace tools path."""
-    import sys
-    from pathlib import Path
-
-    tools_path = Path(__file__).parents[1] / "head_pod" / "workspace" / "tools"
-    if not tools_path.exists():
-        pytest.skip("head_pod/workspace/tools not present in this environment")
-    if str(tools_path) not in sys.path:
-        sys.path.insert(0, str(tools_path))
-    from find_skill import find_skills, search  # noqa: F401
+    assert params["additionalProperties"] is False
