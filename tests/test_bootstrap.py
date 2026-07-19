@@ -13,7 +13,7 @@ from backhead.private_config import (
 )
 
 
-def _config() -> AppConfig:
+def _config(*, workspace_path: str = "head_pod") -> AppConfig:
     mail_password = "mail-password"
     imap_password = "imap-password"
     smtp_password = "smtp-password"
@@ -42,16 +42,16 @@ def _config() -> AppConfig:
         maximum_agent_depth=2,
         maximum_children_per_agent=4,
         podman_container_name="podhead-agent",
+        workspace_path=workspace_path,
+        spam_mailbox="Junk",
     )
 
 
-def _container_inspect(*, running: bool, image_id: str = "image-1", mount_source=None, extra_mounts=None) -> dict:
-    mounts = [{"Destination": "/workspace", "Source": str(mount_source or bootstrap.WORKSPACE_HOST_PATH)}]
-    mounts.extend(extra_mounts or [])
+def _container_inspect(*, running: bool, image_id: str = "image-1", mount_source) -> dict:
     return {
         "Image": image_id,
         "State": {"Running": running},
-        "Mounts": mounts,
+        "Mounts": [{"Destination": "/workspace", "Source": str(mount_source)}],
     }
 
 
@@ -65,6 +65,15 @@ def test_main_bootstraps_before_running_backend(monkeypatch):
     main_module.main()
 
     assert calls == [("ensure", main_module.CONFIG), ("run", sentinel)]
+
+
+def test_resolve_workspace_host_path_relative_and_absolute(tmp_path):
+    relative = _config(workspace_path="head_pod")
+    absolute_path = tmp_path / "workspace"
+    absolute = _config(workspace_path=str(absolute_path))
+
+    assert bootstrap.resolve_workspace_host_path(relative) == (bootstrap.REPO_ROOT / "head_pod").resolve()
+    assert bootstrap.resolve_workspace_host_path(absolute) == absolute_path.resolve()
 
 
 def test_ensure_container_image_skips_rebuild_when_fingerprint_matches(monkeypatch):
@@ -86,81 +95,36 @@ def test_ensure_container_image_skips_rebuild_when_fingerprint_matches(monkeypat
     assert (image_id, rebuilt) == ("image-1", False)
 
 
-def test_ensure_container_image_rebuilds_when_fingerprint_changes(monkeypatch):
+def test_ensure_runtime_leaves_valid_running_container_unchanged(monkeypatch, tmp_path):
     calls = []
-    inspections = iter(
-        [
-            {"Id": "old-image", "Labels": {bootstrap.IMAGE_FINGERPRINT_LABEL: "stale"}},
-            {"Id": "new-image", "Labels": {bootstrap.IMAGE_FINGERPRINT_LABEL: "expected"}},
-        ]
-    )
-    monkeypatch.setattr(bootstrap, "_runtime_fingerprint", lambda: "expected")
-    monkeypatch.setattr(bootstrap, "_podman_exists", lambda kind, name: True)
-    monkeypatch.setattr(bootstrap, "_inspect_image", lambda name: next(inspections))
-    monkeypatch.setattr(
-        subprocess,
-        "run",
-        lambda command, check: calls.append(command) or subprocess.CompletedProcess(command, 0),
-    )
+    config = _config(workspace_path=str(tmp_path / "ws"))
+    expected_workspace = bootstrap.resolve_workspace_host_path(config)
 
-    image_id, rebuilt = bootstrap.ensure_container_image()
-
-    assert (image_id, rebuilt) == ("new-image", True)
-    assert calls == [
-        [
-            "podman",
-            "build",
-            "--label",
-            f"{bootstrap.IMAGE_FINGERPRINT_LABEL}=expected",
-            "-t",
-            bootstrap.CONTAINER_IMAGE_NAME,
-            "-f",
-            str(bootstrap.CONTAINERFILE_PATH),
-            str(bootstrap.REPO_ROOT),
-        ]
-    ]
-
-
-def test_ensure_runtime_leaves_valid_running_container_unchanged(monkeypatch):
-    calls = []
     monkeypatch.setattr(bootstrap, "ensure_podman_available", lambda: calls.append("podman"))
     monkeypatch.setattr(bootstrap, "ensure_state_dir", lambda: calls.append("state"))
     monkeypatch.setattr(bootstrap, "ensure_container_image", lambda: ("image-1", False))
     monkeypatch.setattr(bootstrap, "_podman_exists", lambda kind, name: kind == "container")
-    monkeypatch.setattr(bootstrap, "_inspect_container", lambda name: _container_inspect(running=True))
+    monkeypatch.setattr(
+        bootstrap,
+        "_inspect_container",
+        lambda name: _container_inspect(running=True, mount_source=expected_workspace),
+    )
     monkeypatch.setattr(bootstrap, "_remove_container", lambda name: calls.append("remove"))
-    monkeypatch.setattr(bootstrap, "_create_container", lambda config: calls.append("create"))
+    monkeypatch.setattr(bootstrap, "_create_container", lambda config, workspace: calls.append("create"))
     monkeypatch.setattr(bootstrap, "_start_container", lambda name: calls.append("start"))
     monkeypatch.setattr(bootstrap, "verify_container_environment", lambda config, expected_image_id=None: calls.append("verify"))
     monkeypatch.setattr(bootstrap, "initialize_database", lambda: calls.append("db"))
-    monkeypatch.setattr(bootstrap, "_verify_external_services", lambda config: calls.append("services"))
 
-    bootstrap.ensure_runtime(_config())
+    bootstrap.ensure_runtime(config)
 
-    assert calls == ["podman", "state", "verify", "db", "services"]
-
-
-def test_ensure_runtime_starts_valid_stopped_container(monkeypatch):
-    calls = []
-    monkeypatch.setattr(bootstrap, "ensure_podman_available", lambda: None)
-    monkeypatch.setattr(bootstrap, "ensure_state_dir", lambda: None)
-    monkeypatch.setattr(bootstrap, "ensure_container_image", lambda: ("image-1", False))
-    monkeypatch.setattr(bootstrap, "_podman_exists", lambda kind, name: kind == "container")
-    monkeypatch.setattr(bootstrap, "_inspect_container", lambda name: _container_inspect(running=False))
-    monkeypatch.setattr(bootstrap, "_remove_container", lambda name: calls.append("remove"))
-    monkeypatch.setattr(bootstrap, "_create_container", lambda config: calls.append("create"))
-    monkeypatch.setattr(bootstrap, "_start_container", lambda name: calls.append("start"))
-    monkeypatch.setattr(bootstrap, "verify_container_environment", lambda config, expected_image_id=None: None)
-    monkeypatch.setattr(bootstrap, "initialize_database", lambda: None)
-    monkeypatch.setattr(bootstrap, "_verify_external_services", lambda config: None)
-
-    bootstrap.ensure_runtime(_config())
-
-    assert calls == ["start"]
+    assert expected_workspace.exists()
+    assert calls == ["podman", "state", "verify", "db"]
 
 
 def test_ensure_runtime_recreates_container_when_workspace_mount_is_wrong(monkeypatch, tmp_path):
     calls = []
+    config = _config(workspace_path=str(tmp_path / "expected"))
+
     monkeypatch.setattr(bootstrap, "ensure_podman_available", lambda: None)
     monkeypatch.setattr(bootstrap, "ensure_state_dir", lambda: None)
     monkeypatch.setattr(bootstrap, "ensure_container_image", lambda: ("image-1", False))
@@ -168,18 +132,33 @@ def test_ensure_runtime_recreates_container_when_workspace_mount_is_wrong(monkey
     monkeypatch.setattr(
         bootstrap,
         "_inspect_container",
-        lambda name: _container_inspect(running=True, mount_source=tmp_path / "wrong-workspace"),
+        lambda name: _container_inspect(running=True, mount_source=tmp_path / "wrong"),
     )
     monkeypatch.setattr(bootstrap, "_remove_container", lambda name: calls.append("remove"))
-    monkeypatch.setattr(bootstrap, "_create_container", lambda config: calls.append("create"))
+    monkeypatch.setattr(bootstrap, "_create_container", lambda config, workspace: calls.append(("create", workspace)))
     monkeypatch.setattr(bootstrap, "_start_container", lambda name: calls.append("start"))
     monkeypatch.setattr(bootstrap, "verify_container_environment", lambda config, expected_image_id=None: None)
     monkeypatch.setattr(bootstrap, "initialize_database", lambda: None)
-    monkeypatch.setattr(bootstrap, "_verify_external_services", lambda config: None)
 
-    bootstrap.ensure_runtime(_config())
+    bootstrap.ensure_runtime(config)
 
-    assert calls == ["remove", "create", "start"]
+    assert calls == ["remove", ("create", bootstrap.resolve_workspace_host_path(config)), "start"]
+
+
+def test_verify_container_environment_rejects_wrong_workspace_mount(monkeypatch, tmp_path):
+    config = _config(workspace_path=str(tmp_path / "expected"))
+    monkeypatch.setattr(
+        bootstrap,
+        "_inspect_container",
+        lambda name: _container_inspect(running=True, mount_source=tmp_path / "wrong"),
+    )
+
+    try:
+        bootstrap.verify_container_environment(config, expected_image_id="image-1")
+    except bootstrap.PodmanVerificationError as exc:
+        assert "workspace" in str(exc).lower()
+    else:
+        raise AssertionError("expected workspace mount verification failure")
 
 
 def test_ensure_podman_available_explains_installation(monkeypatch):

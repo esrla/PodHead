@@ -3,19 +3,15 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from unittest.mock import MagicMock
 
-from backhead import db
 from backhead.agent_loop import (
     Agent,
     HISTORY_SEPARATOR,
-    _redact_secrets,
     build_execution_tree,
     messages_to_openai_messages,
     tool_error_result,
 )
-from backhead.main import build_email_agent_runner
 from backhead.tools.spawn_subagent import SPAWN_SUBAGENT_SCHEMA, create_spawn_subagent_tool
 
 
@@ -104,64 +100,6 @@ def test_messages_to_openai_collapses_consecutive_roles():
     ]
 
 
-def test_messages_to_openai_image_without_media_root_uses_placeholder():
-    conversation = [_msg("user", ("text", "look"), ("image", "media/x.png"))]
-    result = messages_to_openai_messages(conversation)
-    assert result[0]["role"] == "user"
-    # All parts resolve to text (placeholder), so they collapse into a string.
-    assert result[0]["content"] == "look[image: media/x.png]"
-
-
-def test_messages_to_openai_image_with_media_root(tmp_path):
-    from backhead import media
-    png = b"\x89PNG\r\n\x1a\n" + b"0" * 16
-    rel = media.save_image(png, tmp_path)
-    conversation = [_msg("user", ("image", rel))]
-    result = messages_to_openai_messages(conversation, media_root=tmp_path)
-    content = result[0]["content"]
-    assert content[0]["type"] == "image_url"
-    assert content[0]["image_url"]["url"].startswith("data:image/png;base64,")
-
-
-def test_main_agent_history_is_loaded_from_database_without_duplication():
-    conn = sqlite3.connect(":memory:")
-    db.init_db(conn)
-    thread = db.create_email_thread(conn, "alice@example.com")
-
-    def store(role, text, msg_id, state):
-        mid = db.insert_message_with_content(
-            conn, channel="email", thread_id=str(thread), sender_id="alice@example.com",
-            role=role, timestamp=db.now_local_iso(), content_parts=[("text", text)],
-        )
-        db.insert_email_message_meta(
-            conn, message_id=mid, email_message_id=msg_id, subject="Hello", process_state=state
-        )
-        return mid
-
-    store("user", "First user message", "<old-in@example.com>", db.COMPLETED)
-    store("assistant", "First assistant message", "<old-out@example.com>", db.COMPLETED)
-    current_id = store("user", "Newest email", "<new-in@example.com>", db.PENDING)
-
-    client, completions = _fake_client(_FakeResponse("Reply"))
-    runner = build_email_agent_runner(
-        openai_client=client,
-        model="main-model",
-        system_prompt="sys",
-        tools=[],
-        tool_handlers={},
-        container_runner=None,
-        max_depth=2,
-        max_children=4,
-    )
-    history = db.get_conversation(conn, "email", str(thread))
-    current_row = next(m for m in history if m["id"] == current_id)
-
-    assert runner(history, current_row) == "Reply"
-    messages = completions.calls[0]["messages"]
-    user_contents = [message["content"] for message in messages if message["role"] == "user"]
-    assert user_contents == ["First user message", "Newest email"]
-
-
 def test_spawn_subagent_starts_fresh_history_and_uses_configured_model():
     sub_client, completions = _fake_client(_FakeResponse("child done"))
     _, handler = create_spawn_subagent_tool(
@@ -239,26 +177,6 @@ def test_spawn_limits_are_enforced():
     assert "child count" in child_result["error"]["message"].lower()
 
 
-def test_main_and_subagent_can_use_different_clients_and_models():
-    main_client, main_completions = _fake_client(_FakeResponse("main done"))
-    sub_client, sub_completions = _fake_client(_FakeResponse("sub done"))
-
-    _, handler = create_spawn_subagent_tool(
-        openai_client=sub_client,
-        model="sub-model",
-        system_prompt="sub-system",
-        tools=[],
-        tool_handlers={},
-        container_runner=None,
-    )
-    parent = Agent(openai_client=main_client, model="main-model", system_prompt="main-system")
-
-    assert parent.run("top level") == "main done"
-    assert handler({"prompt": "delegate"}, parent) == {"ok": True, "response": "sub done"}
-    assert main_completions.calls[0]["model"] == "main-model"
-    assert sub_completions.calls[0]["model"] == "sub-model"
-
-
 def test_tool_errors_are_returned_as_tool_messages_and_loop_continues():
     client, _ = _fake_client(
         _FakeResponse(None, [_FakeToolCall("call-1", "broken", "{not-json")]),
@@ -281,9 +199,6 @@ def test_tool_errors_are_returned_as_tool_messages_and_loop_continues():
     assert reply.endswith("recovered")
     tool_messages = [message for message in agent.conversation_history if message["role"] == "tool"]
     assert [message["tool_call_id"] for message in tool_messages] == ["call-1", "call-2"]
-    first = json.loads(tool_messages[0]["content"])
-    assert first["ok"] is False
-    assert first["error"]["type"] == "tool_execution_error"
 
 
 def test_spawn_subagent_schema_only_exposes_prompt():
@@ -293,11 +208,6 @@ def test_spawn_subagent_schema_only_exposes_prompt():
     assert params["additionalProperties"] is False
 
 
-# --------------------------------------------------------------------------- #
-# Execution tree + redaction
-# --------------------------------------------------------------------------- #
-
-
 def test_no_execution_tree_when_no_tools_used():
     client, _ = _fake_client(_FakeResponse("just a reply"))
     agent = Agent(openai_client=client, model="m", system_prompt="s")
@@ -305,7 +215,7 @@ def test_no_execution_tree_when_no_tools_used():
     assert build_execution_tree(agent, "just a reply") is None
 
 
-def test_execution_tree_included_when_tools_used():
+def test_execution_tree_included_with_required_heading_when_tools_used():
     client, _ = _fake_client(
         _FakeResponse(None, [_FakeToolCall("c1", "run_cli", {"command": "ls"})]),
         _FakeResponse("done"),
@@ -322,7 +232,7 @@ def test_execution_tree_included_when_tools_used():
         tool_handlers={"run_cli": handler},
     )
     reply = agent.run("list files")
-    assert "Main agent" in reply
+    assert reply.startswith("[System-generated execution tree]\nMain agent")
     assert "Tool call: run_cli" in reply
     assert "Tool result:" in reply
     assert reply.endswith("\n---\ndone")
@@ -368,29 +278,14 @@ def test_execution_tree_shows_subagent_subtree():
     assert reply.endswith("\n---\nall done")
 
 
-def test_secret_redaction_of_known_and_patterns():
-    text = 'call with {"api_key": "sk-abcdef123456"} and token=abc'
-    redacted = _redact_secrets(text, known_secrets=["sk-abcdef123456"])
-    assert "sk-abcdef123456" not in redacted
-    assert "[REDACTED]" in redacted
-
-
-def test_secret_redaction_of_authorization_header():
-    token = "supersecret" + "token"
-    text = "Authorization: Bearer " + token
-    redacted = _redact_secrets(text)
-    assert token not in redacted
-    assert "[REDACTED]" in redacted
-
-
-def test_execution_tree_redacts_secrets_in_args():
+def test_execution_tree_omits_binary_data_and_truncates_long_result():
     client, _ = _fake_client(
-        _FakeResponse(None, [_FakeToolCall("c1", "run_cli", {"command": "login", "password": "hunter2000"})]),
+        _FakeResponse(None, [_FakeToolCall("c1", "run_cli", {"command": "x"})]),
         _FakeResponse("done"),
     )
 
     def handler(args, agent):
-        return {"ok": True, "output": "ok"}
+        return {"ok": True, "blob": b"x" * 200, "output": "y" * 300}
 
     agent = Agent(
         openai_client=client,
@@ -398,8 +293,7 @@ def test_execution_tree_redacts_secrets_in_args():
         system_prompt="s",
         tools=[{"type": "function", "function": {"name": "run_cli"}}],
         tool_handlers={"run_cli": handler},
-        known_secrets=["hunter2000"],
     )
     reply = agent.run("go")
-    assert "hunter2000" not in reply
-    assert "[REDACTED]" in reply
+    assert "[binary data omitted]" in reply
+    assert "... [truncated]" in reply

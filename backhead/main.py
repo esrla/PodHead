@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections import defaultdict, deque
+from dataclasses import dataclass
+from pathlib import Path
 import sqlite3
 import subprocess
 import threading
@@ -11,9 +14,8 @@ from typing import Any, Callable
 from backhead import db, mail
 from backhead import media as media_mod
 from backhead.agent_loop import Agent, DEFAULT_SYSTEM_PROMPT, messages_to_openai_messages
-from backhead.bootstrap import ensure_runtime
-from backhead.bootstrap import open_db_connection
 from backhead.bootstrap import STATE_DIR
+from backhead.bootstrap import ensure_runtime, open_db_connection
 from backhead.llm import create_openai_client
 from backhead.private_config import CONFIG, AppConfig
 from backhead.tools.cli_tool import create_cli_tool
@@ -26,21 +28,27 @@ class ContainerExecutionError(RuntimeError):
     error_type = "container_execution_error"
 
 
+@dataclass(frozen=True)
+class QueuedEmailJob:
+    message_id: int
+    transport: mail.EmailTransportData
+
+
 class RuntimeContext:
     def __init__(self, config: AppConfig, conn: sqlite3.Connection) -> None:
         self.config = config
         self.conn = conn
         self.db_lock = threading.Lock()
-        self.processing_tasks: dict[int, asyncio.Task] = {}
+        self.processing_tasks: dict[str, asyncio.Task] = {}
         self.processing_tasks_lock = asyncio.Lock()
+        self.queue_lock = asyncio.Lock()
+        self.thread_queues: dict[str, deque[QueuedEmailJob]] = defaultdict(deque)
         self.semaphore = asyncio.Semaphore(config.maximum_concurrent_conversations)
-
 
 
 def _db_call(runtime: RuntimeContext, func: Callable[..., Any], *args, **kwargs):
     with runtime.db_lock:
         return func(runtime.conn, *args, **kwargs)
-
 
 
 def _current_message_prompt(current_message: dict, media_root: Path | None):
@@ -106,7 +114,6 @@ def build_email_agent_runner(
     return run_agent
 
 
-
 def create_podman_runner(container_name: str, timeout_seconds: int = 300):
     def run_in_container(command: str) -> str:
         quoted = f"cd /workspace && {command}"
@@ -129,7 +136,6 @@ def create_podman_runner(container_name: str, timeout_seconds: int = 300):
         return output.strip()
 
     return run_in_container
-
 
 
 def create_tooling(*, config: AppConfig, container_runner):
@@ -165,107 +171,64 @@ def create_tooling(*, config: AppConfig, container_runner):
     }
 
 
-
-def _message_to_incoming_email(row: dict, sender: str) -> mail.IncomingEmail:
-    return mail.IncomingEmail(
-        from_header=sender,
-        subject=row.get("subject") or "",
-        content_parts=[],
-        message_id=row.get("email_message_id"),
-        in_reply_to=row.get("in_reply_to"),
-        references=row.get("references_header"),
-        timestamp=None,
-    )
+async def _pop_next_job(runtime: RuntimeContext, thread_id: str) -> QueuedEmailJob | None:
+    async with runtime.queue_lock:
+        queue = runtime.thread_queues.get(thread_id)
+        if not queue:
+            return None
+        return queue.popleft() if queue else None
 
 
-
-
-
-async def _process_conversation(
-    runtime: RuntimeContext,
-    email_thread_id: int,
-    run_agent,
-    container_runner,
-) -> None:
+async def _process_conversation(runtime: RuntimeContext, thread_id: str, run_agent) -> None:
     async with runtime.semaphore:
         while True:
-            message_row = await asyncio.to_thread(
-                _db_call, runtime, db.claim_next_pending_email_message, email_thread_id
-            )
-            if message_row is None:
+            job = await _pop_next_job(runtime, thread_id)
+            if job is None:
                 return
-            thread_id = str(email_thread_id)
-            sender = await asyncio.to_thread(
-                _db_call, runtime, db.get_email_thread_sender, email_thread_id
-            )
-            history = await asyncio.to_thread(
-                _db_call, runtime, db.get_conversation, "email", thread_id
-            )
-            incoming = _message_to_incoming_email(message_row, sender or "")
+
+            history = await asyncio.to_thread(_db_call, runtime, db.get_conversation, "email", thread_id)
+            current_message = next((m for m in history if m["id"] == job.message_id), None)
+            if current_message is None:
+                continue
+
             try:
-                reply_text = await asyncio.to_thread(run_agent, history, message_row)
-                outgoing, outgoing_message_id = mail.build_reply_email(
+                reply_text = await asyncio.to_thread(run_agent, history, current_message)
+                outgoing, _ = mail.build_reply_email(
                     from_address=runtime.config.email_account.address,
-                    incoming=incoming,
-                    to=sender or "",
+                    to=job.transport.sender_id,
+                    subject=job.transport.subject,
                     body=reply_text,
+                    thread_id=thread_id,
+                    incoming_message_id=job.transport.incoming_message_id,
+                    references_header=job.transport.references,
                 )
                 await asyncio.to_thread(mail.send_reply_smtp, outgoing, runtime.config.smtp)
                 ts = db.now_local_iso()
-                asst_id = await asyncio.to_thread(
+                await asyncio.to_thread(
                     _db_call,
                     runtime,
                     db.insert_message_with_content,
                     channel="email",
                     thread_id=thread_id,
-                    sender_id="assistant",
+                    sender_id=job.transport.sender_id,
                     role="assistant",
                     timestamp=ts,
                     content_parts=[("text", reply_text)],
                 )
-                await asyncio.to_thread(
-                    _db_call,
-                    runtime,
-                    db.insert_email_message_meta,
-                    message_id=asst_id,
-                    email_message_id=outgoing_message_id,
-                    subject=outgoing.subject,
-                    process_state=db.COMPLETED,
-                )
-                await asyncio.to_thread(
-                    _db_call,
-                    runtime,
-                    db.update_email_message_state,
-                    message_row["id"],
-                    db.COMPLETED,
-                    None,
-                )
             except Exception as exc:  # noqa: BLE001
-                await asyncio.to_thread(
-                    _db_call,
-                    runtime,
-                    db.update_email_message_state,
-                    message_row["id"],
-                    db.FAILED,
-                    str(exc),
-                )
-                return
+                print(f"Failed to process message {job.message_id} in thread {thread_id}: {exc}")
 
 
-async def schedule_conversation(
-    runtime: RuntimeContext, email_thread_id: int, run_agent, container_runner
-) -> None:
+async def schedule_conversation(runtime: RuntimeContext, thread_id: str, run_agent) -> None:
     async with runtime.processing_tasks_lock:
-        existing = runtime.processing_tasks.get(email_thread_id)
+        existing = runtime.processing_tasks.get(thread_id)
         if existing and not existing.done():
             return
-        task = asyncio.create_task(
-            _process_conversation(runtime, email_thread_id, run_agent, container_runner)
-        )
-        runtime.processing_tasks[email_thread_id] = task
+        task = asyncio.create_task(_process_conversation(runtime, thread_id, run_agent))
+        runtime.processing_tasks[thread_id] = task
 
-        def _cleanup(_task, email_thread_id=email_thread_id):
-            runtime.processing_tasks.pop(email_thread_id, None)
+        def _cleanup(_task, thread_id=thread_id):
+            runtime.processing_tasks.pop(thread_id, None)
 
         task.add_done_callback(_cleanup)
 
@@ -276,27 +239,37 @@ def _poll_inbox_with_db_lock(runtime: RuntimeContext) -> list[dict]:
             conn=runtime.conn,
             whitelist=runtime.config.sender_whitelist,
             imap_config=runtime.config.imap,
+            spam_mailbox=runtime.config.spam_mailbox,
             media_root=MEDIA_ROOT,
         )
 
 
-async def poll_and_schedule(runtime: RuntimeContext, run_agent, container_runner) -> None:
+async def poll_and_schedule(runtime: RuntimeContext, run_agent) -> None:
     results = await asyncio.to_thread(_poll_inbox_with_db_lock, runtime)
-    queued_threads = {
-        result["email_thread_id"] for result in results if result.get("status") == "queued"
-    }
-    await asyncio.to_thread(_db_call, runtime, db.requeue_failed_email_messages)
-    pending_threads = await asyncio.to_thread(
-        _db_call, runtime, db.list_email_threads_with_work
-    )
-    for email_thread_id in sorted(set(pending_threads) | queued_threads):
-        await schedule_conversation(runtime, email_thread_id, run_agent, container_runner)
+    queued_by_thread: dict[str, list[QueuedEmailJob]] = defaultdict(list)
+    for result in results:
+        if result.get("status") != "queued":
+            continue
+        transport = result.get("transport")
+        thread_id = result.get("thread_id")
+        message_id = result.get("message_id")
+        if not isinstance(transport, mail.EmailTransportData):
+            continue
+        if not isinstance(thread_id, str) or not isinstance(message_id, int):
+            continue
+        queued_by_thread[thread_id].append(QueuedEmailJob(message_id=message_id, transport=transport))
+
+    async with runtime.queue_lock:
+        for thread_id, jobs in queued_by_thread.items():
+            runtime.thread_queues[thread_id].extend(jobs)
+
+    for thread_id in sorted(queued_by_thread):
+        await schedule_conversation(runtime, thread_id, run_agent)
 
 
 async def run_backend(config: AppConfig = CONFIG) -> None:
     conn = open_db_connection()
     runtime = RuntimeContext(config, conn)
-    await asyncio.to_thread(_db_call, runtime, db.reset_processing_email_messages)
     container_runner = create_podman_runner(config.podman_container_name)
     tooling = create_tooling(config=config, container_runner=container_runner)
     run_agent = build_email_agent_runner(
@@ -312,9 +285,8 @@ async def run_backend(config: AppConfig = CONFIG) -> None:
     )
 
     while True:
-        await poll_and_schedule(runtime, run_agent, container_runner)
+        await poll_and_schedule(runtime, run_agent)
         await asyncio.sleep(config.mail_polling_interval_seconds)
-
 
 
 def main() -> None:

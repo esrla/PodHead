@@ -8,15 +8,13 @@ from pathlib import Path
 import sqlite3
 import subprocess
 
-from backhead import db, mail
-from backhead.llm import create_openai_client, test_openai_endpoint
+from backhead import db
 from backhead.private_config import CONFIG, AppConfig
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 STATE_DIR = REPO_ROOT / "state"
 DB_PATH = STATE_DIR / "agent.db"
 CONTAINER_IMAGE_NAME = "podhead-agent-image"
-WORKSPACE_HOST_PATH = (REPO_ROOT / "head_pod").resolve()
 CONTAINERFILE_PATH = REPO_ROOT / "Containerfile"
 PRIVATE_CONFIG_PATH = Path(__file__).resolve().parent / "private_config.py"
 BACKEND_PATH = (REPO_ROOT / "backhead").resolve()
@@ -54,6 +52,17 @@ def validate_config(config: AppConfig) -> None:
     }
     if any(value.startswith("replace-") for value in placeholder_values):
         raise ValueError("Replace the demonstration values in backhead/private_config.py before running PodHead.")
+    if not config.workspace_path.strip():
+        raise ValueError("workspace_path must not be empty.")
+    if not config.spam_mailbox.strip():
+        raise ValueError("spam_mailbox must not be empty.")
+
+
+def resolve_workspace_host_path(config: AppConfig) -> Path:
+    configured = Path(config.workspace_path)
+    if configured.is_absolute():
+        return configured.resolve()
+    return (REPO_ROOT / configured).resolve()
 
 
 def _runtime_fingerprint() -> str:
@@ -160,14 +169,14 @@ def _workspace_mount_source(inspect: dict) -> Path | None:
     return None
 
 
-def _has_forbidden_mounts(inspect: dict) -> bool:
+def _has_forbidden_mounts(inspect: dict, workspace_host_path: Path) -> bool:
     forbidden_sources = {PRIVATE_CONFIG_PATH, BACKEND_PATH, REPO_ROOT}
     for mount in inspect.get("Mounts") or []:
         source_value = mount.get("Source")
         if not source_value:
             continue
         source = Path(source_value).resolve()
-        if source == WORKSPACE_HOST_PATH:
+        if source == workspace_host_path:
             continue
         if source in forbidden_sources:
             return True
@@ -176,12 +185,14 @@ def _has_forbidden_mounts(inspect: dict) -> bool:
     return False
 
 
-def _container_requires_recreation(inspect: dict, expected_image_id: str) -> bool:
+def _container_requires_recreation(
+    inspect: dict, expected_image_id: str, workspace_host_path: Path
+) -> bool:
     if inspect.get("Image") != expected_image_id:
         return True
-    if _workspace_mount_source(inspect) != WORKSPACE_HOST_PATH:
+    if _workspace_mount_source(inspect) != workspace_host_path:
         return True
-    if _has_forbidden_mounts(inspect):
+    if _has_forbidden_mounts(inspect, workspace_host_path):
         return True
     return False
 
@@ -190,7 +201,7 @@ def _remove_container(name: str) -> None:
     subprocess.run(["podman", "rm", "-f", name], check=True)
 
 
-def _create_container(config: AppConfig) -> None:
+def _create_container(config: AppConfig, workspace_host_path: Path) -> None:
     subprocess.run(
         [
             "podman",
@@ -198,7 +209,7 @@ def _create_container(config: AppConfig) -> None:
             "--name",
             config.podman_container_name,
             "--mount",
-            f"type=bind,src={WORKSPACE_HOST_PATH},dst=/workspace",
+            f"type=bind,src={workspace_host_path},dst=/workspace",
             CONTAINER_IMAGE_NAME,
         ],
         check=True,
@@ -210,6 +221,7 @@ def _start_container(name: str) -> None:
 
 
 def verify_container_environment(config: AppConfig, *, expected_image_id: str | None = None) -> None:
+    workspace_host_path = resolve_workspace_host_path(config)
     inspect = _inspect_container(config.podman_container_name)
     state = inspect.get("State") or {}
     if not state.get("Running"):
@@ -218,9 +230,9 @@ def verify_container_environment(config: AppConfig, *, expected_image_id: str | 
         raise PodmanVerificationError(
             f"Container {config.podman_container_name!r} is not using the expected image."
         )
-    if _workspace_mount_source(inspect) != WORKSPACE_HOST_PATH:
-        raise PodmanVerificationError("Expected head_pod to be mounted at /workspace.")
-    if _has_forbidden_mounts(inspect):
+    if _workspace_mount_source(inspect) != workspace_host_path:
+        raise PodmanVerificationError("Expected configured workspace to be mounted at /workspace.")
+    if _has_forbidden_mounts(inspect, workspace_host_path):
         raise PodmanVerificationError("Forbidden backend or configuration mount detected.")
 
     completed = subprocess.run(
@@ -238,54 +250,25 @@ def initialize_database() -> None:
     conn.close()
 
 
-def _test_imap(config: AppConfig) -> None:
-    client = mail._open_imap_connection(config.imap)
-    try:
-        client.login(config.imap.username, config.imap.password)
-        status, _ = client.select(config.imap.inbox)
-        if status != "OK":
-            raise RuntimeError(f"Failed to select inbox {config.imap.inbox!r}")
-    finally:
-        try:
-            client.logout()
-        except Exception:  # noqa: BLE001
-            pass
-
-
-def _test_smtp(config: AppConfig) -> None:
-    with mail.smtplib.SMTP(config.smtp.host, config.smtp.port, timeout=30) as smtp:
-        if config.smtp.use_tls:
-            smtp.starttls()
-        smtp.login(config.smtp.username, config.smtp.password)
-
-
-def _verify_external_services(config: AppConfig) -> None:
-    main_client = create_openai_client(config.main_agent.base_url, config.main_agent.api_key)
-    sub_client = create_openai_client(config.subagent.base_url, config.subagent.api_key)
-    test_openai_endpoint(main_client, config.main_agent.model)
-    test_openai_endpoint(sub_client, config.subagent.model)
-    _test_imap(config)
-    _test_smtp(config)
-
-
 def ensure_runtime(config: AppConfig = CONFIG) -> None:
     validate_config(config)
     ensure_podman_available()
     ensure_state_dir()
+    workspace_host_path = resolve_workspace_host_path(config)
+    workspace_host_path.mkdir(parents=True, exist_ok=True)
     image_id, _ = ensure_container_image()
 
     if _podman_exists("container", config.podman_container_name):
         inspect = _inspect_container(config.podman_container_name)
-        if _container_requires_recreation(inspect, image_id):
+        if _container_requires_recreation(inspect, image_id, workspace_host_path):
             _remove_container(config.podman_container_name)
-            _create_container(config)
+            _create_container(config, workspace_host_path)
             _start_container(config.podman_container_name)
         elif not (inspect.get("State") or {}).get("Running"):
             _start_container(config.podman_container_name)
     else:
-        _create_container(config)
+        _create_container(config, workspace_host_path)
         _start_container(config.podman_container_name)
 
     verify_container_environment(config, expected_image_id=image_id)
     initialize_database()
-    _verify_external_services(config)
