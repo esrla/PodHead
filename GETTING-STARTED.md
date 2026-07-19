@@ -6,7 +6,6 @@
 6. Open backhead/private_config.py.
 7. Replace the demonstration values with your values and do not commit real secrets.
 8. Start the configured local OpenAI-compatible model servers.
-9. Run the bootstrap mechanism.
-10. Start the backend.
-11. Send a test email from a whitelisted address.
-12. Verify the reply, database, and container.
+9. Start the backend with `python -m backhead.main`.
+10. Send a test email from a whitelisted address.
+11. Verify the reply, database, and container.
