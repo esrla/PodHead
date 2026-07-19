@@ -219,7 +219,9 @@ class Agent:
 
     def _append_tool_result(self, tool_call_id: str, result: Any) -> None:
         if isinstance(result, (dict, list)):
-            content = json.dumps(result)
+            content = json.dumps(_sanitize_for_preview(result))
+        elif isinstance(result, (bytes, bytearray)):
+            content = "[binary data omitted]"
         else:
             content = str(result)
         self.conversation_history.append(

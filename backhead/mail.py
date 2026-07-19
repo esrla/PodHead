@@ -18,7 +18,7 @@ from backhead import db
 from backhead import media as media_mod
 
 MESSAGE_ID_PATTERN = re.compile(r"<[^<>]+>")
-THREAD_MARKER_PATTERN = re.compile(r"<podhead\.([0-9a-f]{64})\.[^<>@]+@[^<>@]+>", re.IGNORECASE)
+THREAD_MARKER_PATTERN = re.compile(r"podhead\.([0-9a-f]{64})\.", re.IGNORECASE)
 
 
 class ContentPart(NamedTuple):

@@ -108,7 +108,18 @@ def test_async_processing_of_different_conversations(monkeypatch):
 def test_fifo_processing_within_one_conversation(monkeypatch):
     conn = _conn()
     first = _queue_message(conn, "alice@example.com", "<a1@example.com>", "first", timestamp=1)
-    second = _queue_message(conn, "alice@example.com", "<a2@example.com>", "second", timestamp=2)
+    second = mail.store_incoming_email(
+        conn=conn,
+        incoming=mail.IncomingEmail(
+            from_header="alice@example.com",
+            subject="Hello",
+            content_parts=[mail.ContentPart(kind="text", text="second")],
+            message_id="<a2@example.com>",
+            in_reply_to=f"<podhead.{first['thread_id']}.token@example.com>",
+            timestamp=2,
+        ),
+        whitelist={"alice@example.com", "bob@example.com"},
+    )
     runtime = RuntimeContext(_config(), conn)
     monkeypatch.setattr(mail, "send_reply_smtp", lambda outgoing, smtp_config: None)
     _enqueue(runtime, first)
