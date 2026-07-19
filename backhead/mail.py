@@ -275,7 +275,8 @@ def _build_references_header(existing_refs: list[str], incoming_message_id: str 
 
 
 def generate_outgoing_message_id(thread_id: str) -> str:
-    generated = normalize_message_id(make_msgid(idstring=f"podhead.{thread_id}.{hashlib.sha1(db.now_local_iso().encode()).hexdigest()[:12]}"))
+    token = hashlib.sha256(db.now_local_iso().encode("utf-8")).hexdigest()[:16]
+    generated = normalize_message_id(make_msgid(idstring=f"podhead.{thread_id}.{token}"))
     if generated is None:
         raise ValueError("Failed to generate a valid Message-ID for outgoing email")
     return generated
