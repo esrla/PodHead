@@ -11,7 +11,8 @@ import threading
 from typing import Any, Callable
 
 from backhead import db, mail
-from backhead.agent_loop import Agent, DEFAULT_SYSTEM_PROMPT, history_to_openai_messages
+from backhead import media as media_mod
+from backhead.agent_loop import Agent, DEFAULT_SYSTEM_PROMPT, messages_to_openai_messages
 from backhead.llm import create_openai_client, test_openai_endpoint
 from backhead.private_config import CONFIG, AppConfig
 from backhead.tools.cli_tool import create_cli_tool
@@ -20,6 +21,7 @@ from backhead.tools.spawn_subagent import create_spawn_subagent_tool
 REPO_ROOT = Path(__file__).resolve().parent.parent
 STATE_DIR = REPO_ROOT / "state"
 DB_PATH = STATE_DIR / "agent.db"
+MEDIA_ROOT = STATE_DIR
 CONTAINER_IMAGE_NAME = "podhead-agent-image"
 WORKSPACE_HOST_PATH = (REPO_ROOT / "head_pod" / "workspace").resolve()
 PRIVATE_CONFIG_PATH = Path(__file__).resolve().parent / "private_config.py"
@@ -64,6 +66,36 @@ def open_db_connection(path: Path = DB_PATH) -> sqlite3.Connection:
 
 
 
+def _current_message_prompt(current_message: dict, media_root: Path | None):
+    """Build an OpenAI prompt (str or content list) from a stored message."""
+    oai_parts: list[dict] = []
+    for part in current_message.get("content", []):
+        ct = part["content_type"]
+        val = part["content"]
+        if ct == "text":
+            oai_parts.append({"type": "text", "text": val})
+        elif ct == "image":
+            if media_root:
+                b64 = media_mod.load_image_as_base64(val, media_root)
+                if b64:
+                    mime = media_mod.get_image_mime_type(val)
+                    oai_parts.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{mime};base64,{b64}"},
+                        }
+                    )
+                else:
+                    oai_parts.append({"type": "text", "text": "[image not found]"})
+            else:
+                oai_parts.append({"type": "text", "text": f"[image: {val}]"})
+    if not oai_parts:
+        return ""
+    if all(p["type"] == "text" for p in oai_parts):
+        return "".join(p["text"] for p in oai_parts)
+    return oai_parts
+
+
 def build_email_agent_runner(
     *,
     openai_client,
@@ -74,10 +106,11 @@ def build_email_agent_runner(
     container_runner,
     max_depth: int,
     max_children: int,
+    media_root: Path | None = None,
 ):
-    def run_agent(history: list[dict], incoming_message: dict) -> str:
-        prior_rows = [row for row in history if row["id"] != incoming_message["id"]]
-        prior_messages = history_to_openai_messages(prior_rows)
+    def run_agent(history: list[dict], current_message: dict) -> str:
+        prior = [row for row in history if row["id"] != current_message["id"]]
+        prior_messages = messages_to_openai_messages(prior, media_root=media_root)
         agent = Agent(
             openai_client=openai_client,
             model=model,
@@ -90,7 +123,8 @@ def build_email_agent_runner(
             max_depth=max_depth,
             max_children=max_children,
         )
-        return agent.run(incoming_message["content"])
+        prompt = _current_message_prompt(current_message, media_root)
+        return agent.run(prompt)
 
     return run_agent
 
@@ -214,11 +248,11 @@ def _message_to_incoming_email(row: dict, sender: str) -> mail.IncomingEmail:
     return mail.IncomingEmail(
         from_header=sender,
         subject=row.get("subject") or "",
-        body=row["content"],
+        content_parts=[],
         message_id=row.get("email_message_id"),
         in_reply_to=row.get("in_reply_to"),
         references=row.get("references_header"),
-        timestamp=row.get("timestamp"),
+        timestamp=None,
     )
 
 
@@ -307,17 +341,24 @@ def _test_smtp(config: AppConfig) -> None:
 
 async def _process_conversation(
     runtime: RuntimeContext,
-    conversation_id: int,
+    email_thread_id: int,
     run_agent,
     container_runner,
 ) -> None:
     async with runtime.semaphore:
         while True:
-            message_row = await asyncio.to_thread(_db_call, runtime, db.claim_next_pending_message, conversation_id)
+            message_row = await asyncio.to_thread(
+                _db_call, runtime, db.claim_next_pending_email_message, email_thread_id
+            )
             if message_row is None:
                 return
-            sender = await asyncio.to_thread(_db_call, runtime, db.get_conversation_sender, conversation_id)
-            history = await asyncio.to_thread(_db_call, runtime, db.get_conversation_history, conversation_id)
+            thread_id = str(email_thread_id)
+            sender = await asyncio.to_thread(
+                _db_call, runtime, db.get_email_thread_sender, email_thread_id
+            )
+            history = await asyncio.to_thread(
+                _db_call, runtime, db.get_conversation, "email", thread_id
+            )
             incoming = _message_to_incoming_email(message_row, sender or "")
             try:
                 reply_text = await asyncio.to_thread(run_agent, history, message_row)
@@ -328,21 +369,31 @@ async def _process_conversation(
                     body=reply_text,
                 )
                 await asyncio.to_thread(mail.send_reply_smtp, outgoing, runtime.config.smtp)
+                ts = db.now_local_iso()
+                asst_id = await asyncio.to_thread(
+                    _db_call,
+                    runtime,
+                    db.insert_message_with_content,
+                    channel="email",
+                    thread_id=thread_id,
+                    sender_id="assistant",
+                    role="assistant",
+                    timestamp=ts,
+                    content_parts=[("text", reply_text)],
+                )
                 await asyncio.to_thread(
                     _db_call,
                     runtime,
-                    db.insert_message,
-                    conversation_id=conversation_id,
+                    db.insert_email_message_meta,
+                    message_id=asst_id,
                     email_message_id=outgoing_message_id,
-                    direction="outgoing",
-                    content=reply_text,
                     subject=outgoing.subject,
                     process_state=db.COMPLETED,
                 )
                 await asyncio.to_thread(
                     _db_call,
                     runtime,
-                    db.update_message_state,
+                    db.update_email_message_state,
                     message_row["id"],
                     db.COMPLETED,
                     None,
@@ -351,7 +402,7 @@ async def _process_conversation(
                 await asyncio.to_thread(
                     _db_call,
                     runtime,
-                    db.update_message_state,
+                    db.update_email_message_state,
                     message_row["id"],
                     db.FAILED,
                     str(exc),
@@ -359,16 +410,20 @@ async def _process_conversation(
                 return
 
 
-async def schedule_conversation(runtime: RuntimeContext, conversation_id: int, run_agent, container_runner) -> None:
+async def schedule_conversation(
+    runtime: RuntimeContext, email_thread_id: int, run_agent, container_runner
+) -> None:
     async with runtime.processing_tasks_lock:
-        existing = runtime.processing_tasks.get(conversation_id)
+        existing = runtime.processing_tasks.get(email_thread_id)
         if existing and not existing.done():
             return
-        task = asyncio.create_task(_process_conversation(runtime, conversation_id, run_agent, container_runner))
-        runtime.processing_tasks[conversation_id] = task
+        task = asyncio.create_task(
+            _process_conversation(runtime, email_thread_id, run_agent, container_runner)
+        )
+        runtime.processing_tasks[email_thread_id] = task
 
-        def _cleanup(_task, conversation_id=conversation_id):
-            runtime.processing_tasks.pop(conversation_id, None)
+        def _cleanup(_task, email_thread_id=email_thread_id):
+            runtime.processing_tasks.pop(email_thread_id, None)
 
         task.add_done_callback(_cleanup)
 
@@ -379,16 +434,21 @@ def _poll_inbox_with_db_lock(runtime: RuntimeContext) -> list[dict]:
             conn=runtime.conn,
             whitelist=runtime.config.sender_whitelist,
             imap_config=runtime.config.imap,
+            media_root=MEDIA_ROOT,
         )
 
 
 async def poll_and_schedule(runtime: RuntimeContext, run_agent, container_runner) -> None:
     results = await asyncio.to_thread(_poll_inbox_with_db_lock, runtime)
-    queued_conversations = {result["conversation_id"] for result in results if result.get("status") == "queued"}
-    await asyncio.to_thread(_db_call, runtime, db.requeue_failed_messages)
-    pending_conversations = await asyncio.to_thread(_db_call, runtime, db.list_conversations_with_work)
-    for conversation_id in sorted(set(pending_conversations) | queued_conversations):
-        await schedule_conversation(runtime, conversation_id, run_agent, container_runner)
+    queued_threads = {
+        result["email_thread_id"] for result in results if result.get("status") == "queued"
+    }
+    await asyncio.to_thread(_db_call, runtime, db.requeue_failed_email_messages)
+    pending_threads = await asyncio.to_thread(
+        _db_call, runtime, db.list_email_threads_with_work
+    )
+    for email_thread_id in sorted(set(pending_threads) | queued_threads):
+        await schedule_conversation(runtime, email_thread_id, run_agent, container_runner)
 
 
 async def run_backend(config: AppConfig = CONFIG) -> None:
@@ -396,7 +456,7 @@ async def run_backend(config: AppConfig = CONFIG) -> None:
     verify_container_environment(config)
     conn = open_db_connection()
     runtime = RuntimeContext(config, conn)
-    await asyncio.to_thread(_db_call, runtime, db.reset_processing_messages)
+    await asyncio.to_thread(_db_call, runtime, db.reset_processing_email_messages)
     container_runner = create_podman_runner(config.podman_container_name)
     tooling = create_tooling(config=config, container_runner=container_runner)
     run_agent = build_email_agent_runner(
@@ -408,6 +468,7 @@ async def run_backend(config: AppConfig = CONFIG) -> None:
         container_runner=container_runner,
         max_depth=config.maximum_agent_depth,
         max_children=config.maximum_children_per_agent,
+        media_root=MEDIA_ROOT,
     )
 
     while True:

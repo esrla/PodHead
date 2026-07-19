@@ -34,13 +34,13 @@ def _config(maximum_concurrent_conversations: int = 2) -> AppConfig:
         ),
         email_account=EmailAccountConfig(
             address="podhead@example.com",
-            password="demo-account-password",
+            password="secret",
         ),
         imap=IMAPConfig(
             host="imap.example.com",
             port=993,
             username="imap-user",
-            password="demo-imap-password",
+            password="secret",
             inbox="INBOX",
             use_ssl=True,
         ),
@@ -48,7 +48,7 @@ def _config(maximum_concurrent_conversations: int = 2) -> AppConfig:
             host="smtp.example.com",
             port=587,
             username="smtp-user",
-            password="demo-smtp-password",
+            password="secret",
             use_tls=True,
         ),
         sender_whitelist=["alice@example.com", "bob@example.com"],
@@ -60,12 +60,16 @@ def _config(maximum_concurrent_conversations: int = 2) -> AppConfig:
     )
 
 
-
 def _conn(path: str | None = None):
     conn = sqlite3.connect(path or ":memory:", check_same_thread=False)
     db.init_db(conn)
     return conn
 
+
+def _message_text(message_row: dict) -> str:
+    return "".join(
+        p["content"] for p in message_row.get("content", []) if p["content_type"] == "text"
+    )
 
 
 def _queue_message(
@@ -83,14 +87,13 @@ def _queue_message(
         incoming=mail.IncomingEmail(
             from_header=sender,
             subject=subject,
-            body=body,
+            content_parts=[mail.ContentPart(kind="text", text=body)],
             message_id=message_id,
             in_reply_to=in_reply_to,
             timestamp=timestamp,
         ),
         whitelist={"alice@example.com", "bob@example.com"},
     )
-
 
 
 def test_async_processing_of_different_conversations(monkeypatch):
@@ -100,20 +103,19 @@ def test_async_processing_of_different_conversations(monkeypatch):
     runtime = RuntimeContext(_config(maximum_concurrent_conversations=2), conn)
     monkeypatch.setattr(mail, "send_reply_smtp", lambda outgoing, smtp_config: None)
 
-    def run_agent(history, incoming_message):
+    def run_agent(history, message_row):
         time.sleep(SIMULATED_AGENT_DELAY)
-        return f"reply:{incoming_message['content']}"
+        return f"reply:{_message_text(message_row)}"
 
     async def run_test():
         start = time.perf_counter()
-        await schedule_conversation(runtime, first["conversation_id"], run_agent, None)
-        await schedule_conversation(runtime, second["conversation_id"], run_agent, None)
+        await schedule_conversation(runtime, first["email_thread_id"], run_agent, None)
+        await schedule_conversation(runtime, second["email_thread_id"], run_agent, None)
         await asyncio.gather(*runtime.processing_tasks.values())
         return time.perf_counter() - start
 
     elapsed = asyncio.run(run_test())
     assert elapsed < MAX_CONCURRENT_PROCESSING_TIME
-
 
 
 def test_fifo_processing_within_one_conversation(monkeypatch):
@@ -131,18 +133,17 @@ def test_fifo_processing_within_one_conversation(monkeypatch):
     monkeypatch.setattr(mail, "send_reply_smtp", lambda outgoing, smtp_config: None)
     seen: list[str] = []
 
-    def run_agent(history, incoming_message):
-        seen.append(incoming_message["content"])
+    def run_agent(history, message_row):
+        seen.append(_message_text(message_row))
         time.sleep(0.05)
-        return f"reply:{incoming_message['content']}"
+        return f"reply:{_message_text(message_row)}"
 
     async def run_test():
-        await schedule_conversation(runtime, first["conversation_id"], run_agent, None)
+        await schedule_conversation(runtime, first["email_thread_id"], run_agent, None)
         await asyncio.gather(*runtime.processing_tasks.values())
 
     asyncio.run(run_test())
     assert seen == ["first", "second"]
-
 
 
 def test_pending_work_survives_restart(monkeypatch, tmp_path):
@@ -155,21 +156,21 @@ def test_pending_work_survives_restart(monkeypatch, tmp_path):
     runtime = RuntimeContext(_config(), restarted)
     monkeypatch.setattr(mail, "send_reply_smtp", lambda outgoing, smtp_config: None)
 
-    def run_agent(history, incoming_message):
+    def run_agent(history, message_row):
         return "done"
 
     async def run_test():
-        await schedule_conversation(runtime, queued["conversation_id"], run_agent, None)
+        await schedule_conversation(runtime, queued["email_thread_id"], run_agent, None)
         await asyncio.gather(*runtime.processing_tasks.values())
 
     asyncio.run(run_test())
-    states = [
-        row["process_state"]
-        for row in db.get_conversation_history(restarted, queued["conversation_id"])
-        if row["direction"] == "incoming"
+    history = db.get_conversation(restarted, "email", str(queued["email_thread_id"]))
+    user_states = [
+        db.get_email_message_meta(restarted, row["id"])["process_state"]
+        for row in history
+        if row["role"] == "user"
     ]
-    assert states == [db.COMPLETED]
-
+    assert user_states == [db.COMPLETED]
 
 
 def test_retry_after_processing_failure(monkeypatch):
@@ -179,23 +180,22 @@ def test_retry_after_processing_failure(monkeypatch):
     monkeypatch.setattr(mail, "send_reply_smtp", lambda outgoing, smtp_config: None)
     attempts = {"count": 0}
 
-    def run_agent(history, incoming_message):
+    def run_agent(history, message_row):
         attempts["count"] += 1
         if attempts["count"] == 1:
             raise RuntimeError("temporary failure")
         return "done"
 
     async def run_once():
-        await schedule_conversation(runtime, queued["conversation_id"], run_agent, None)
+        await schedule_conversation(runtime, queued["email_thread_id"], run_agent, None)
         await asyncio.gather(*runtime.processing_tasks.values())
 
     asyncio.run(run_once())
-    assert db.get_message(conn, queued["message_row_id"])["process_state"] == db.FAILED
+    assert db.get_email_message_meta(conn, queued["message_id"])["process_state"] == db.FAILED
 
-    db.requeue_failed_messages(conn)
+    db.requeue_failed_email_messages(conn)
     asyncio.run(run_once())
-    assert db.get_message(conn, queued["message_row_id"])["process_state"] == db.COMPLETED
-
+    assert db.get_email_message_meta(conn, queued["message_id"])["process_state"] == db.COMPLETED
 
 
 def test_real_podman_command_routing_uses_exec_boundary(monkeypatch):
@@ -215,10 +215,9 @@ def test_real_podman_command_routing_uses_exec_boundary(monkeypatch):
     assert calls[0][:3] == ["podman", "exec", "podhead-agent"]
 
 
-
 def test_processing_messages_are_requeued_after_restart():
     conn = _conn()
     queued = _queue_message(conn, "alice@example.com", "<processing@example.com>", "work", timestamp=1)
-    db.update_message_state(conn, queued["message_row_id"], db.PROCESSING)
-    db.reset_processing_messages(conn)
-    assert db.get_message(conn, queued["message_row_id"])["process_state"] == db.PENDING
+    db.update_email_message_state(conn, queued["message_id"], db.PROCESSING)
+    db.reset_processing_email_messages(conn)
+    assert db.get_email_message_meta(conn, queued["message_id"])["process_state"] == db.PENDING

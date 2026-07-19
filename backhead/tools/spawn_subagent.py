@@ -72,9 +72,12 @@ def create_spawn_subagent_tool(
             depth=calling_agent.depth + 1,
             max_depth=max_depth,
             max_children=max_children,
+            known_secrets=getattr(calling_agent, "known_secrets", None),
         )
         try:
-            return {"ok": True, "response": child.run(prompt)}
+            response = child.run(prompt)
+            calling_agent._pending_child_agent = child
+            return {"ok": True, "response": response}
         except Exception as exc:  # noqa: BLE001
             return tool_error_result(
                 getattr(exc, "error_type", "tool_execution_error"),

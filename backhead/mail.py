@@ -1,4 +1,9 @@
-"""Mail parsing, routing, IMAP polling, and SMTP sending helpers."""
+"""Mail parsing, routing, IMAP polling, and SMTP sending helpers.
+
+The email adapter normalizes incoming email into the generic message model
+defined in :mod:`backhead.db`. An email becomes one ``messages`` row (role
+``user``) plus one ``message_content`` row per ordered content part.
+"""
 
 from __future__ import annotations
 
@@ -6,25 +11,41 @@ from dataclasses import dataclass
 from email import message_from_bytes, policy
 from email.message import EmailMessage, Message
 from email.utils import formataddr, make_msgid, parseaddr
+from html.parser import HTMLParser
 import imaplib
+from pathlib import Path
 import re
 import smtplib
-from typing import Callable
+from typing import Callable, NamedTuple
 
 from backhead import db
+from backhead import media as media_mod
 
 MESSAGE_ID_PATTERN = re.compile(r"<[^<>]+>")
+
+
+class ContentPart(NamedTuple):
+    kind: str  # 'text', 'image_bytes', 'audio_placeholder', 'video_placeholder'
+    text: str = ""
+    image_bytes: bytes = b""
+    mime_type: str = ""
 
 
 @dataclass(frozen=True)
 class IncomingEmail:
     from_header: str
     subject: str
-    body: str
+    content_parts: list  # list[ContentPart] — ordered content
     message_id: str | None = None
     in_reply_to: str | None = None
     references: str | None = None
-    timestamp: int | None = None
+    timestamp: int | float | None = None
+
+    @property
+    def body(self) -> str:
+        """Return concatenation of all text parts (convenience)."""
+        texts = [p.text for p in self.content_parts if p.kind == "text"]
+        return "\n\n".join(t for t in texts if t)
 
 
 @dataclass(frozen=True)
@@ -61,12 +82,10 @@ class IMAPConfigProtocol:
     use_ssl: bool
 
 
-
 def normalize_sender(from_header: str) -> str | None:
     _, address = parseaddr(from_header or "")
     normalized = (address or "").strip().lower()
     return normalized or None
-
 
 
 def normalize_message_id(value: str | None) -> str | None:
@@ -82,20 +101,69 @@ def normalize_message_id(value: str | None) -> str | None:
     return normalized
 
 
-
 def normalize_references(value: str | None) -> list[str]:
     if not value:
         return []
     return [m.group(0).strip().lower() for m in MESSAGE_ID_PATTERN.finditer(value)]
 
 
+# --------------------------------------------------------------------------- #
+# HTML -> text conversion
+# --------------------------------------------------------------------------- #
+
+
+class _TextExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self._parts: list[str] = []
+        self._skip = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self._skip = True
+        elif tag in ("br", "p", "div", "tr", "h1", "h2", "h3", "h4", "h5", "h6"):
+            self._parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style"):
+            self._skip = False
+
+    def handle_data(self, data):
+        if not self._skip:
+            self._parts.append(data)
+
+    def get_text(self) -> str:
+        text = "".join(self._parts)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+
+
+def _html_to_text(html: str) -> str:
+    extractor = _TextExtractor()
+    extractor.feed(html)
+    return extractor.get_text()
+
+
+# --------------------------------------------------------------------------- #
+# MIME parsing into ordered content parts
+# --------------------------------------------------------------------------- #
+
+
+def _content_id(part: Message) -> str | None:
+    cid = part.get("Content-ID")
+    if not cid:
+        return None
+    return cid.strip().strip("<>").lower()
+
 
 def parse_mime_message(raw_message: bytes) -> IncomingEmail:
+    """Parse raw email bytes into an :class:`IncomingEmail` with ordered parts."""
     parsed = message_from_bytes(raw_message, policy=policy.default)
+    parts = _extract_content_parts(parsed)
     return IncomingEmail(
         from_header=parsed.get("From", ""),
         subject=parsed.get("Subject", ""),
-        body=_extract_text_body(parsed),
+        content_parts=parts,
         message_id=parsed.get("Message-ID"),
         in_reply_to=parsed.get("In-Reply-To"),
         references=parsed.get("References"),
@@ -103,26 +171,77 @@ def parse_mime_message(raw_message: bytes) -> IncomingEmail:
     )
 
 
+def _extract_content_parts(message: Message) -> list[ContentPart]:
+    parts: list[ContentPart] = []
+    seen_content_ids: set[str] = set()
+    html_fallback: str | None = None
+    have_plain_text = False
 
-def _extract_text_body(message: Message) -> str:
-    if message.is_multipart():
-        text_parts: list[str] = []
-        for part in message.walk():
-            if part.get_content_maintype() == "multipart":
-                continue
-            if part.get_content_disposition() == "attachment":
-                continue
-            if part.get_content_type() == "text/plain":
-                text_parts.append(part.get_content())
-        if text_parts:
-            return "\n\n".join(part.strip() for part in text_parts if part.strip())
-        for part in message.walk():
-            if part.get_content_type() == "text/html":
-                return part.get_content().strip()
-        return ""
-    content = message.get_content()
-    return content.strip() if isinstance(content, str) else ""
+    if not message.is_multipart():
+        content = message.get_content()
+        ctype = message.get_content_type()
+        if ctype == "text/plain" and isinstance(content, str):
+            stripped = content.strip()
+            if stripped:
+                parts.append(ContentPart(kind="text", text=stripped))
+        elif ctype == "text/html" and isinstance(content, str):
+            text = _html_to_text(content)
+            if text:
+                parts.append(ContentPart(kind="text", text=text))
+        return parts
 
+    for part in message.walk():
+        maintype = part.get_content_maintype()
+        ctype = part.get_content_type()
+        if maintype == "multipart":
+            continue
+
+        if ctype == "text/plain":
+            content = part.get_content()
+            if isinstance(content, str) and content.strip():
+                parts.append(ContentPart(kind="text", text=content.strip()))
+                have_plain_text = True
+        elif ctype == "text/html":
+            content = part.get_content()
+            if isinstance(content, str):
+                text = _html_to_text(content)
+                if text and html_fallback is None:
+                    html_fallback = text
+        elif maintype == "image":
+            cid = _content_id(part)
+            if cid is not None and cid in seen_content_ids:
+                continue
+            if cid is not None:
+                seen_content_ids.add(cid)
+            payload = part.get_payload(decode=True)
+            if payload:
+                parts.append(
+                    ContentPart(
+                        kind="image_bytes",
+                        image_bytes=payload,
+                        mime_type=ctype,
+                    )
+                )
+        elif maintype == "audio":
+            parts.append(
+                ContentPart(kind="audio_placeholder", text="[audio attachment omitted]")
+            )
+        elif maintype == "video":
+            parts.append(
+                ContentPart(kind="video_placeholder", text="[video attachment omitted]")
+            )
+        # other types (application/*, etc.) are skipped
+
+    if not have_plain_text and html_fallback:
+        # Insert the HTML-derived text at the front so it reads first.
+        parts.insert(0, ContentPart(kind="text", text=html_fallback))
+
+    return parts
+
+
+# --------------------------------------------------------------------------- #
+# Reply header helpers
+# --------------------------------------------------------------------------- #
 
 
 def _subject_for_reply(subject: str) -> str:
@@ -133,15 +252,15 @@ def _subject_for_reply(subject: str) -> str:
     return f"Re: {subject}"
 
 
-
-def _build_references_header(existing_refs: list[str], incoming_message_id: str | None) -> str | None:
+def _build_references_header(
+    existing_refs: list[str], incoming_message_id: str | None
+) -> str | None:
     refs = list(existing_refs)
     if incoming_message_id and incoming_message_id not in refs:
         refs.append(incoming_message_id)
     if not refs:
         return None
     return " ".join(refs)
-
 
 
 def _build_outgoing_headers(
@@ -162,12 +281,41 @@ def _build_outgoing_headers(
     return outgoing_message_id, headers
 
 
+# --------------------------------------------------------------------------- #
+# Storage
+# --------------------------------------------------------------------------- #
+
+
+def _content_parts_for_storage(
+    incoming: IncomingEmail,
+    media_root: Path | None,
+) -> list[tuple[str, str]]:
+    stored: list[tuple[str, str]] = []
+    for part in incoming.content_parts:
+        if part.kind == "text":
+            if part.text:
+                stored.append(("text", part.text))
+        elif part.kind in ("audio_placeholder", "video_placeholder"):
+            if part.text:
+                stored.append(("text", part.text))
+        elif part.kind == "image_bytes":
+            if media_root is not None:
+                rel = media_mod.save_image(part.image_bytes, media_root)
+                if rel is not None:
+                    stored.append(("image", rel))
+                else:
+                    stored.append(("text", "[unsupported image omitted]"))
+            else:
+                stored.append(("text", "[image omitted]"))
+    return stored
+
 
 def store_incoming_email(
     *,
     conn,
     incoming: IncomingEmail,
     whitelist: set[str] | list[str],
+    media_root: Path | None = None,
 ) -> dict:
     sender = normalize_sender(incoming.from_header)
     normalized_whitelist = {s.strip().lower() for s in whitelist}
@@ -178,43 +326,49 @@ def store_incoming_email(
     in_reply_to = normalize_message_id(incoming.in_reply_to)
     references = normalize_references(incoming.references)
 
-    if incoming_message_id and db.has_incoming_message_id(conn, incoming_message_id):
+    if incoming_message_id and db.has_incoming_email_message_id(conn, incoming_message_id):
         return {"status": "ignored_duplicate_message"}
 
-    conversation_id = db.resolve_conversation_from_references(
+    thread_id = db.resolve_email_thread_from_references(
         conn,
-        sender_normalized=sender,
+        sender_id=sender,
         in_reply_to=in_reply_to,
         references=references,
     )
-    if conversation_id is None:
-        conversation_id = db.create_conversation(
-            conn,
-            sender_normalized=sender,
-            created_ts=incoming.timestamp,
-        )
+    created_ts = db.convert_to_local_iso(incoming.timestamp)
+    if thread_id is None:
+        thread_id = db.create_email_thread(conn, sender_id=sender, created_ts=created_ts)
 
-    message_row_id = db.insert_message(
+    content_parts = _content_parts_for_storage(incoming, media_root)
+    if not content_parts:
+        content_parts = [("text", "")]
+
+    message_row_id = db.insert_message_with_content(
         conn,
-        conversation_id=conversation_id,
+        channel="email",
+        thread_id=str(thread_id),
+        sender_id=sender,
+        role="user",
+        timestamp=created_ts,
+        content_parts=content_parts,
+    )
+    db.insert_email_message_meta(
+        conn,
+        message_id=message_row_id,
         email_message_id=incoming_message_id,
-        direction="incoming",
-        content=incoming.body,
-        subject=incoming.subject,
-        timestamp=incoming.timestamp,
         in_reply_to=in_reply_to,
         references_header=" ".join(references) if references else None,
+        subject=incoming.subject,
         process_state=db.PENDING,
     )
 
     return {
         "status": "queued",
         "sender": sender,
-        "conversation_id": conversation_id,
+        "email_thread_id": thread_id,
         "incoming_message_id": incoming_message_id,
-        "message_row_id": message_row_id,
+        "message_id": message_row_id,
     }
-
 
 
 def build_reply_email(
@@ -244,7 +398,6 @@ def build_reply_email(
     )
 
 
-
 def send_reply_smtp(outgoing: OutgoingEmail, smtp_config: SMTPConfigProtocol) -> None:
     message = EmailMessage()
     message["From"] = formataddr(("PodHead", outgoing.from_address))
@@ -264,15 +417,19 @@ def send_reply_smtp(outgoing: OutgoingEmail, smtp_config: SMTPConfigProtocol) ->
         raise SMTPDeliveryError(str(exc)) from exc
 
 
-
 def _open_imap_connection(imap_config: IMAPConfigProtocol):
     if imap_config.use_ssl:
         return imaplib.IMAP4_SSL(imap_config.host, imap_config.port)
     return imaplib.IMAP4(imap_config.host, imap_config.port)
 
 
-
-def poll_inbox(*, conn, whitelist: set[str] | list[str], imap_config: IMAPConfigProtocol) -> list[dict]:
+def poll_inbox(
+    *,
+    conn,
+    whitelist: set[str] | list[str],
+    imap_config: IMAPConfigProtocol,
+    media_root: Path | None = None,
+) -> list[dict]:
     try:
         with _open_imap_connection(imap_config) as client:
             client.login(imap_config.username, imap_config.password)
@@ -293,7 +450,12 @@ def poll_inbox(*, conn, whitelist: set[str] | list[str], imap_config: IMAPConfig
                 if not isinstance(payload, (bytes, bytearray)):
                     continue
                 incoming = parse_mime_message(bytes(payload))
-                result = store_incoming_email(conn=conn, incoming=incoming, whitelist=whitelist)
+                result = store_incoming_email(
+                    conn=conn,
+                    incoming=incoming,
+                    whitelist=whitelist,
+                    media_root=media_root,
+                )
                 results.append(result)
                 client.store(raw_id, "+FLAGS", "\\Seen")
             return results
@@ -303,45 +465,72 @@ def poll_inbox(*, conn, whitelist: set[str] | list[str], imap_config: IMAPConfig
         raise IMAPPollError(str(exc)) from exc
 
 
-
 def process_incoming_email(
     *,
     conn,
     incoming: IncomingEmail,
     whitelist: set[str] | list[str],
-    run_agent: Callable[[list[dict], IncomingEmail], str],
+    run_agent: Callable[[list[dict], dict], str],
     send_reply: Callable[[OutgoingEmail], None],
     generated_message_id: str | None = None,
     from_address: str = "podhead@example.com",
+    media_root: Path | None = None,
 ) -> dict:
-    result = store_incoming_email(conn=conn, incoming=incoming, whitelist=whitelist)
+    """Store, run agent, send reply, store reply."""
+    result = store_incoming_email(
+        conn=conn, incoming=incoming, whitelist=whitelist, media_root=media_root
+    )
     if result["status"] != "queued":
         return result
 
-    history = db.get_conversation_history(conn, result["conversation_id"])
-    db.update_message_state(conn, result["message_row_id"], db.PROCESSING)
+    thread_id = str(result["email_thread_id"])
+    history = db.get_conversation(conn, "email", thread_id)
+    message_id = result["message_id"]
+    db.update_email_message_state(conn, message_id, db.PROCESSING)
+
+    current_message = next(m for m in history if m["id"] == message_id)
+
     try:
-        assistant_text = run_agent(history, incoming)
+        assistant_text = run_agent(history, current_message)
+
+        meta = db.get_email_message_meta(conn, message_id)
+        temp_incoming = IncomingEmail(
+            from_header=result["sender"],
+            subject=(meta.get("subject") if meta else None) or incoming.subject,
+            content_parts=[],
+            message_id=meta.get("email_message_id") if meta else None,
+            in_reply_to=meta.get("in_reply_to") if meta else None,
+            references=meta.get("references_header") if meta else None,
+        )
         outgoing, outgoing_message_id = build_reply_email(
             from_address=from_address,
-            incoming=incoming,
+            incoming=temp_incoming,
             to=result["sender"],
             body=assistant_text,
             generated_message_id=generated_message_id,
         )
         send_reply(outgoing)
-        db.insert_message(
+
+        ts = db.now_local_iso()
+        asst_message_id = db.insert_message_with_content(
             conn,
-            conversation_id=result["conversation_id"],
+            channel="email",
+            thread_id=thread_id,
+            sender_id="assistant",
+            role="assistant",
+            timestamp=ts,
+            content_parts=[("text", assistant_text)],
+        )
+        db.insert_email_message_meta(
+            conn,
+            message_id=asst_message_id,
             email_message_id=outgoing_message_id,
-            direction="outgoing",
-            content=assistant_text,
             subject=outgoing.subject,
             process_state=db.COMPLETED,
         )
-        db.update_message_state(conn, result["message_row_id"], db.COMPLETED)
+        db.update_email_message_state(conn, message_id, db.COMPLETED)
     except Exception as exc:  # noqa: BLE001
-        db.update_message_state(conn, result["message_row_id"], db.FAILED, str(exc))
+        db.update_email_message_state(conn, message_id, db.FAILED, str(exc))
         raise
 
     result["status"] = "processed"

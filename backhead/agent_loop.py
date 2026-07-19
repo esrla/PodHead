@@ -1,9 +1,14 @@
-"""Agent loop and conversation-history conversion helpers."""
+"""Agent loop, execution-tree tracking, and message-history conversion helpers."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
+from pathlib import Path
+import re
 from typing import Any
+
+from backhead.media import get_image_mime_type, load_image_as_base64
 
 AGENT_WORKSPACE_GUIDE = "/workspace/AGENT.md"
 HISTORY_SEPARATOR = "\n\n---\n\n"
@@ -30,30 +35,182 @@ def tool_error_result(
     }
 
 
-def history_to_openai_messages(history_rows: list[dict]) -> list[dict]:
-    """Convert ordered database rows to OpenAI messages.
+# --------------------------------------------------------------------------- #
+# Secret redaction
+# --------------------------------------------------------------------------- #
 
-    Consecutive messages with the same role are collapsed into one message and
-    separated with ``\n\n---\n\n``.
-    """
-    messages: list[dict[str, str]] = []
-    for row in history_rows:
-        direction = row.get("direction")
-        content = row.get("content", "")
-        if direction == "incoming":
-            role = "user"
-        elif direction == "outgoing":
-            role = "assistant"
+_SECRET_FIELD_PATTERNS = re.compile(
+    r"(api[_-]?key|password|passwd|secret|token|auth|authorization|bearer|credential|private[_-]?key|access[_-]?token|refresh[_-]?token|cookie)",
+    re.IGNORECASE,
+)
+
+
+def _redact_secrets(text: str, known_secrets: list[str] | None = None) -> str:
+    """Redact known secrets and common secret patterns from text."""
+    result = text
+    if known_secrets:
+        for secret in known_secrets:
+            if secret and len(secret) > 4:
+                result = result.replace(secret, "[REDACTED]")
+    result = re.sub(
+        r'("(?:api[_-]?key|password|passwd|secret|token|auth(?:orization)?|bearer|credential|private[_-]?key|access[_-]?token|refresh[_-]?token|cookie)"\s*:\s*)"[^"]*"',
+        r'\1"[REDACTED]"',
+        result,
+        flags=re.IGNORECASE,
+    )
+    result = re.sub(
+        r"(Authorization:\s*(?:Bearer|Basic)\s+)\S+",
+        r"\1[REDACTED]",
+        result,
+        flags=re.IGNORECASE,
+    )
+    return result
+
+
+# --------------------------------------------------------------------------- #
+# Execution tree
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class ToolRecord:
+    name: str
+    args_display: str
+    result_preview: str
+    child_agent: "Agent | None" = None
+
+
+def _preview(text: str, max_chars: int = 100) -> str:
+    """Return preview of text, truncated and marked if needed."""
+    text = re.sub(
+        r"data:image/[^;]+;base64,[A-Za-z0-9+/=]+",
+        "[image base64 omitted]",
+        text,
+    )
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "... [truncated]"
+
+
+def _format_args_display(args_json: str, known_secrets: list[str] | None = None) -> str:
+    """Format tool arguments for display, redacting secrets."""
+    return _redact_secrets(args_json, known_secrets)
+
+
+def _format_result_preview(result: Any, known_secrets: list[str] | None = None) -> str:
+    """Format tool result as a redacted preview."""
+    if isinstance(result, (dict, list)):
+        text = json.dumps(result)
+    else:
+        text = str(result)
+    text = _redact_secrets(text, known_secrets)
+    return _preview(text)
+
+
+def _build_tree_lines(
+    agent_label: str,
+    tool_records: list[ToolRecord],
+    indent: str = "",
+    prefix: str = "",
+) -> list[str]:
+    """Build execution tree lines for one agent level."""
+    lines = [f"{prefix}{agent_label}"]
+    total = len(tool_records)
+    for i, rec in enumerate(tool_records):
+        is_last = i == total - 1
+        connector = "└──" if is_last else "├──"
+        child_indent = indent + ("    " if is_last else "│   ")
+        lines.append(f"{indent}{connector} Tool call: {rec.name}({rec.args_display})")
+
+        if rec.child_agent is not None:
+            child_label_indent = child_indent
+            child_records = rec.child_agent._tool_records
+            child_reply_preview = _preview(rec.child_agent._final_reply or "")
+            child_lines = _build_tree_lines(
+                "Subagent",
+                child_records,
+                indent=child_label_indent + "    ",
+                prefix=child_label_indent,
+            )
+            for cl in child_lines:
+                lines.append(cl)
+            if child_reply_preview:
+                lines.append(f"{child_label_indent}    └── Reply: {child_reply_preview}")
         else:
-            continue
+            lines.append(f"{child_indent}└── Tool result: {rec.result_preview}")
 
-        if messages and messages[-1]["role"] == role:
-            previous = messages[-1].get("content") or ""
-            messages[-1]["content"] = f"{previous}{HISTORY_SEPARATOR}{content}"
-            continue
+    return lines
 
-        messages.append({"role": role, "content": content})
-    return messages
+
+def build_execution_tree(agent: "Agent", final_reply: str) -> str | None:
+    """Build the execution tree text if tools were used, else return None."""
+    if not agent._tool_records:
+        return None
+    lines = _build_tree_lines("Main agent", agent._tool_records)
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# Message-history conversion
+# --------------------------------------------------------------------------- #
+
+
+def messages_to_openai_messages(
+    conversation: list[dict],
+    media_root: Path | None = None,
+) -> list[dict]:
+    """Convert generic stored messages to OpenAI Chat Completions format.
+
+    Consecutive same-role messages are merged with ``HISTORY_SEPARATOR`` between
+    them. Content is a plain string for text-only messages, or a list of content
+    dicts when any image part is present.
+    """
+    processed: list[dict] = []
+    for stored_msg in conversation:
+        role = stored_msg["role"]
+        parts = stored_msg.get("content", [])
+        oai_parts: list[dict] = []
+        for part in parts:
+            ct = part["content_type"]
+            val = part["content"]
+            if ct == "text":
+                oai_parts.append({"type": "text", "text": val})
+            elif ct == "image":
+                if media_root:
+                    b64 = load_image_as_base64(val, media_root)
+                    if b64:
+                        mime = get_image_mime_type(val)
+                        oai_parts.append(
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:{mime};base64,{b64}"},
+                            }
+                        )
+                    else:
+                        oai_parts.append({"type": "text", "text": "[image not found]"})
+                else:
+                    oai_parts.append({"type": "text", "text": f"[image: {val}]"})
+        if oai_parts:
+            processed.append({"role": role, "parts": oai_parts})
+
+    merged: list[dict] = []
+    for item in processed:
+        if merged and merged[-1]["role"] == item["role"]:
+            merged[-1]["parts"].append({"type": "text", "text": HISTORY_SEPARATOR})
+            merged[-1]["parts"].extend(item["parts"])
+        else:
+            merged.append({"role": item["role"], "parts": list(item["parts"])})
+
+    result: list[dict] = []
+    for item in merged:
+        parts = item["parts"]
+        if all(p["type"] == "text" for p in parts):
+            content: str | list = "".join(p["text"] for p in parts)
+        else:
+            content = parts
+        result.append({"role": item["role"], "content": content})
+
+    return result
 
 
 class Agent:
@@ -72,6 +229,7 @@ class Agent:
         depth: int = 0,
         max_depth: int = 2,
         max_children: int = 4,
+        known_secrets: list[str] | None = None,
     ) -> None:
         self.openai_client = openai_client
         self.model = model
@@ -83,7 +241,11 @@ class Agent:
         self.depth = depth
         self.max_depth = max_depth
         self.max_children = max_children
+        self.known_secrets: list[str] = list(known_secrets or [])
+        self._tool_records: list[ToolRecord] = []
+        self._final_reply: str = ""
         self._children_spawned = 0
+        self._pending_child_agent: "Agent | None" = None
 
     def _append_tool_result(self, tool_call_id: str, result: Any) -> None:
         if isinstance(result, (dict, list)):
@@ -98,10 +260,12 @@ class Agent:
             }
         )
 
-    def run(self, prompt: str) -> str:
+    def run(self, prompt: str | list) -> str:
         """Append *prompt* as a user message and run the agent loop to completion."""
         self.conversation_history.append({"role": "user", "content": prompt})
+        return self._run_loop()
 
+    def _run_loop(self) -> str:
         while True:
             kwargs: dict[str, Any] = {
                 "model": self.model,
@@ -137,33 +301,37 @@ class Agent:
             self.conversation_history.append(assistant_turn)
 
             if not msg.tool_calls:
-                return msg.content or ""
+                final_reply = msg.content or ""
+                self._final_reply = final_reply
+                if self.depth == 0:
+                    tree = build_execution_tree(self, final_reply)
+                    if tree:
+                        return f"{tree}\n---\n{final_reply}"
+                return final_reply
 
             for tc in msg.tool_calls:
                 tool_name = tc.function.name
                 handler = self.tool_handlers.get(tool_name)
                 if handler is None:
-                    self._append_tool_result(
-                        tc.id,
-                        tool_error_result(
-                            "tool_execution_error",
-                            f"Unknown tool '{tool_name}'.",
-                            "No backend handler is registered for this tool.",
-                        ),
+                    result = tool_error_result(
+                        "tool_execution_error",
+                        f"Unknown tool '{tool_name}'.",
+                        "No backend handler is registered for this tool.",
                     )
+                    self._record_tool(tool_name, tc.function.arguments, result, None)
+                    self._append_tool_result(tc.id, result)
                     continue
 
                 try:
                     args = json.loads(tc.function.arguments)
                 except json.JSONDecodeError as exc:
-                    self._append_tool_result(
-                        tc.id,
-                        tool_error_result(
-                            "tool_execution_error",
-                            "Invalid JSON arguments.",
-                            str(exc),
-                        ),
+                    result = tool_error_result(
+                        "tool_execution_error",
+                        "Invalid JSON arguments.",
+                        str(exc),
                     )
+                    self._record_tool(tool_name, tc.function.arguments, result, None)
+                    self._append_tool_result(tc.id, result)
                     continue
 
                 try:
@@ -181,4 +349,24 @@ class Agent:
                         "Tool execution failed.",
                         str(exc),
                     )
+
+                child_agent = self._pending_child_agent
+                self._pending_child_agent = None
+                self._record_tool(tool_name, tc.function.arguments, result, child_agent)
                 self._append_tool_result(tc.id, result)
+
+    def _record_tool(
+        self,
+        tool_name: str,
+        args_json: str,
+        result: Any,
+        child_agent: "Agent | None",
+    ) -> None:
+        self._tool_records.append(
+            ToolRecord(
+                name=tool_name,
+                args_display=_format_args_display(args_json, self.known_secrets),
+                result_preview=_format_result_preview(result, self.known_secrets),
+                child_agent=child_agent,
+            )
+        )
