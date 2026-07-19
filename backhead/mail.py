@@ -9,6 +9,7 @@ from email.utils import formataddr, make_msgid, parseaddr
 from html.parser import HTMLParser
 import hashlib
 import imaplib
+import json
 from pathlib import Path
 import re
 import secrets
@@ -116,7 +117,11 @@ def normalize_references(value: str | None) -> list[str]:
 
 
 def deterministic_thread_id(sender_id: str, incoming_message_id: str) -> str:
-    source = f"{sender_id}\n{incoming_message_id}".encode("utf-8")
+    source = json.dumps(
+        {"sender_id": sender_id, "incoming_message_id": incoming_message_id},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
     return hashlib.sha256(source).hexdigest()
 
 
@@ -146,7 +151,12 @@ def resolve_thread_id(
             return decoded
     if incoming_message_id:
         return deterministic_thread_id(sender_id, incoming_message_id)
-    return hashlib.sha256(f"{sender_id}\n{db.now_local_iso()}".encode("utf-8")).hexdigest()
+    fallback_source = json.dumps(
+        {"sender_id": sender_id, "in_reply_to": in_reply_to, "references": references},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(fallback_source).hexdigest()
 
 
 class _TextExtractor(HTMLParser):
@@ -426,8 +436,8 @@ def _extract_response_bytes(response) -> bytes | None:
     return None
 
 
-def _fetch_uid_bytes(client, uid: bytes, query: str) -> bytes | None:
-    status, fetched = client.uid("FETCH", uid, query)
+def _fetch_uid_bytes(client, uid: bytes, fetch_spec: str) -> bytes | None:
+    status, fetched = client.uid("FETCH", uid, fetch_spec)
     if status != "OK":
         return None
     return _extract_response_bytes(fetched)
