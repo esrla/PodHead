@@ -39,8 +39,17 @@ def tool_error_result(
 # Secret redaction
 # --------------------------------------------------------------------------- #
 
-_SECRET_FIELD_PATTERNS = re.compile(
-    r"(api[_-]?key|password|passwd|secret|token|auth|authorization|bearer|credential|private[_-]?key|access[_-]?token|refresh[_-]?token|cookie)",
+# Matches secret-like JSON field names (used in _redact_secrets below).
+_SECRET_FIELD_NAMES = (
+    r"api[_-]?key|password|passwd|secret|token|auth(?:orization)?"
+    r"|bearer|credential|private[_-]?key|access[_-]?token|refresh[_-]?token|cookie"
+)
+_SECRET_JSON_FIELD_RE = re.compile(
+    rf'("(?:{_SECRET_FIELD_NAMES})"\s*:\s*)"[^"]*"',
+    re.IGNORECASE,
+)
+_SECRET_AUTH_HEADER_RE = re.compile(
+    r"(Authorization:\s*(?:Bearer|Basic)\s+)\S+",
     re.IGNORECASE,
 )
 
@@ -52,18 +61,8 @@ def _redact_secrets(text: str, known_secrets: list[str] | None = None) -> str:
         for secret in known_secrets:
             if secret and len(secret) > 4:
                 result = result.replace(secret, "[REDACTED]")
-    result = re.sub(
-        r'("(?:api[_-]?key|password|passwd|secret|token|auth(?:orization)?|bearer|credential|private[_-]?key|access[_-]?token|refresh[_-]?token|cookie)"\s*:\s*)"[^"]*"',
-        r'\1"[REDACTED]"',
-        result,
-        flags=re.IGNORECASE,
-    )
-    result = re.sub(
-        r"(Authorization:\s*(?:Bearer|Basic)\s+)\S+",
-        r"\1[REDACTED]",
-        result,
-        flags=re.IGNORECASE,
-    )
+    result = _SECRET_JSON_FIELD_RE.sub(r'\1"[REDACTED]"', result)
+    result = _SECRET_AUTH_HEADER_RE.sub(r"\1[REDACTED]", result)
     return result
 
 

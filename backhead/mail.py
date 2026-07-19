@@ -233,7 +233,8 @@ def _extract_content_parts(message: Message) -> list[ContentPart]:
         # other types (application/*, etc.) are skipped
 
     if not have_plain_text and html_fallback:
-        # Insert the HTML-derived text at the front so it reads first.
+        # Fallback: no plain-text part was found, so use the HTML-derived text.
+        # Insert at position 0 so it appears before any inline images.
         parts.insert(0, ContentPart(kind="text", text=html_fallback))
 
     return parts

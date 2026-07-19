@@ -60,6 +60,8 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS email_threads (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             sender_id TEXT NOT NULL,
+            -- ISO 8601 with timezone offset (e.g. 2026-07-19T12:42:31.482+02:00).
+            -- Human-readable and timezone-preserving; matches the messages.timestamp format.
             created_ts TEXT NOT NULL
         )
         """
