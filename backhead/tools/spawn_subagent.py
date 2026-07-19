@@ -72,7 +72,6 @@ def create_spawn_subagent_tool(
             depth=calling_agent.depth + 1,
             max_depth=max_depth,
             max_children=max_children,
-            known_secrets=getattr(calling_agent, "known_secrets", None),
         )
         try:
             response = child.run(prompt)

@@ -135,6 +135,8 @@ class AppConfig:
         maximum_agent_depth: int,
         maximum_children_per_agent: int,
         podman_container_name: str,
+        workspace_path: str,
+        spam_mailbox: str,
     ) -> None:
         self._main_agent = main_agent
         self._subagent = subagent
@@ -147,6 +149,8 @@ class AppConfig:
         self._maximum_agent_depth = maximum_agent_depth
         self._maximum_children_per_agent = maximum_children_per_agent
         self._podman_container_name = podman_container_name
+        self._workspace_path = workspace_path
+        self._spam_mailbox = spam_mailbox
 
     @property
     def main_agent(self) -> AgentEndpointConfig:
@@ -192,6 +196,14 @@ class AppConfig:
     def podman_container_name(self) -> str:
         return self._podman_container_name
 
+    @property
+    def workspace_path(self) -> str:
+        return self._workspace_path
+
+    @property
+    def spam_mailbox(self) -> str:
+        return self._spam_mailbox
+
 
 CONFIG = AppConfig(
     main_agent=AgentEndpointConfig(
@@ -229,4 +241,6 @@ CONFIG = AppConfig(
     maximum_agent_depth=2,
     maximum_children_per_agent=4,
     podman_container_name="podhead-agent",
+    workspace_path="head_pod",
+    spam_mailbox="Junk",
 )

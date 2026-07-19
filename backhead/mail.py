@@ -1,9 +1,4 @@
-"""Mail parsing, routing, IMAP polling, and SMTP sending helpers.
-
-The email adapter normalizes incoming email into the generic message model
-defined in :mod:`backhead.db`. An email becomes one ``messages`` row (role
-``user``) plus one ``message_content`` row per ordered content part.
-"""
+"""Mail parsing, routing, IMAP polling, and SMTP sending helpers."""
 
 from __future__ import annotations
 
@@ -12,20 +7,22 @@ from email import message_from_bytes, policy
 from email.message import EmailMessage, Message
 from email.utils import formataddr, make_msgid, parseaddr
 from html.parser import HTMLParser
+import hashlib
 import imaplib
 from pathlib import Path
 import re
 import smtplib
-from typing import Callable, NamedTuple
+from typing import NamedTuple
 
 from backhead import db
 from backhead import media as media_mod
 
 MESSAGE_ID_PATTERN = re.compile(r"<[^<>]+>")
+THREAD_MARKER_PATTERN = re.compile(r"<podhead\.([0-9a-f]{64})\.[^<>@]+@[^<>@]+>", re.IGNORECASE)
 
 
 class ContentPart(NamedTuple):
-    kind: str  # 'text', 'image_bytes', 'audio_placeholder', 'video_placeholder'
+    kind: str
     text: str = ""
     image_bytes: bytes = b""
     mime_type: str = ""
@@ -35,7 +32,7 @@ class ContentPart(NamedTuple):
 class IncomingEmail:
     from_header: str
     subject: str
-    content_parts: list  # list[ContentPart] — ordered content
+    content_parts: list
     message_id: str | None = None
     in_reply_to: str | None = None
     references: str | None = None
@@ -43,7 +40,6 @@ class IncomingEmail:
 
     @property
     def body(self) -> str:
-        """Return concatenation of all text parts (convenience)."""
         texts = [p.text for p in self.content_parts if p.kind == "text"]
         return "\n\n".join(t for t in texts if t)
 
@@ -55,6 +51,17 @@ class OutgoingEmail:
     subject: str
     body: str
     headers: dict[str, str]
+
+
+@dataclass(frozen=True)
+class EmailTransportData:
+    imap_identifier: str | None
+    incoming_message_id: str | None
+    in_reply_to: str | None
+    references: str | None
+    subject: str
+    sender_id: str
+    thread_id: str
 
 
 class SMTPDeliveryError(RuntimeError):
@@ -107,9 +114,38 @@ def normalize_references(value: str | None) -> list[str]:
     return [m.group(0).strip().lower() for m in MESSAGE_ID_PATTERN.finditer(value)]
 
 
-# --------------------------------------------------------------------------- #
-# HTML -> text conversion
-# --------------------------------------------------------------------------- #
+def deterministic_thread_id(sender_id: str, incoming_message_id: str) -> str:
+    source = f"{sender_id}\n{incoming_message_id}".encode("utf-8")
+    return hashlib.sha256(source).hexdigest()
+
+
+def decode_thread_id_from_message_id(message_id: str | None) -> str | None:
+    if not message_id:
+        return None
+    match = THREAD_MARKER_PATTERN.search(message_id)
+    if not match:
+        return None
+    return match.group(1).lower()
+
+
+def resolve_thread_id(
+    *,
+    sender_id: str,
+    incoming_message_id: str | None,
+    in_reply_to: str | None,
+    references: list[str],
+) -> str:
+    candidates: list[str] = []
+    if in_reply_to:
+        candidates.append(in_reply_to)
+    candidates.extend(reversed(references))
+    for candidate in candidates:
+        decoded = decode_thread_id_from_message_id(candidate)
+        if decoded:
+            return decoded
+    if incoming_message_id:
+        return deterministic_thread_id(sender_id, incoming_message_id)
+    return hashlib.sha256(f"{sender_id}\n{db.now_local_iso()}".encode("utf-8")).hexdigest()
 
 
 class _TextExtractor(HTMLParser):
@@ -144,11 +180,6 @@ def _html_to_text(html: str) -> str:
     return extractor.get_text()
 
 
-# --------------------------------------------------------------------------- #
-# MIME parsing into ordered content parts
-# --------------------------------------------------------------------------- #
-
-
 def _content_id(part: Message) -> str | None:
     cid = part.get("Content-ID")
     if not cid:
@@ -157,7 +188,6 @@ def _content_id(part: Message) -> str | None:
 
 
 def parse_mime_message(raw_message: bytes) -> IncomingEmail:
-    """Parse raw email bytes into an :class:`IncomingEmail` with ordered parts."""
     parsed = message_from_bytes(raw_message, policy=policy.default)
     parts = _extract_content_parts(parsed)
     return IncomingEmail(
@@ -215,34 +245,16 @@ def _extract_content_parts(message: Message) -> list[ContentPart]:
                 seen_content_ids.add(cid)
             payload = part.get_payload(decode=True)
             if payload:
-                parts.append(
-                    ContentPart(
-                        kind="image_bytes",
-                        image_bytes=payload,
-                        mime_type=ctype,
-                    )
-                )
+                parts.append(ContentPart(kind="image_bytes", image_bytes=payload, mime_type=ctype))
         elif maintype == "audio":
-            parts.append(
-                ContentPart(kind="audio_placeholder", text="[audio attachment omitted]")
-            )
+            parts.append(ContentPart(kind="audio_placeholder", text="[audio attachment omitted]"))
         elif maintype == "video":
-            parts.append(
-                ContentPart(kind="video_placeholder", text="[video attachment omitted]")
-            )
-        # other types (application/*, etc.) are skipped
+            parts.append(ContentPart(kind="video_placeholder", text="[video attachment omitted]"))
 
     if not have_plain_text and html_fallback:
-        # Fallback: no plain-text part was found, so use the HTML-derived text.
-        # Insert at position 0 so it appears before any inline images.
         parts.insert(0, ContentPart(kind="text", text=html_fallback))
 
     return parts
-
-
-# --------------------------------------------------------------------------- #
-# Reply header helpers
-# --------------------------------------------------------------------------- #
 
 
 def _subject_for_reply(subject: str) -> str:
@@ -253,9 +265,7 @@ def _subject_for_reply(subject: str) -> str:
     return f"Re: {subject}"
 
 
-def _build_references_header(
-    existing_refs: list[str], incoming_message_id: str | None
-) -> str | None:
+def _build_references_header(existing_refs: list[str], incoming_message_id: str | None) -> str | None:
     refs = list(existing_refs)
     if incoming_message_id and incoming_message_id not in refs:
         refs.append(incoming_message_id)
@@ -264,33 +274,45 @@ def _build_references_header(
     return " ".join(refs)
 
 
-def _build_outgoing_headers(
-    *,
-    incoming_message_id: str | None,
-    references: list[str],
-    generated_message_id: str | None = None,
-) -> tuple[str, dict[str, str]]:
-    outgoing_message_id = normalize_message_id(generated_message_id or make_msgid())
-    if outgoing_message_id is None:
+def generate_outgoing_message_id(thread_id: str) -> str:
+    generated = normalize_message_id(make_msgid(idstring=f"podhead.{thread_id}.{hashlib.sha1(db.now_local_iso().encode()).hexdigest()[:12]}"))
+    if generated is None:
         raise ValueError("Failed to generate a valid Message-ID for outgoing email")
+    return generated
+
+
+def build_reply_email(
+    *,
+    from_address: str,
+    to: str,
+    subject: str,
+    body: str,
+    thread_id: str,
+    incoming_message_id: str | None,
+    references_header: str | None,
+) -> tuple[OutgoingEmail, str]:
+    references = normalize_references(references_header)
+    outgoing_message_id = generate_outgoing_message_id(thread_id)
     headers: dict[str, str] = {"Message-ID": outgoing_message_id}
     if incoming_message_id:
         headers["In-Reply-To"] = incoming_message_id
-    references_header = _build_references_header(references, incoming_message_id)
-    if references_header:
-        headers["References"] = references_header
-    return outgoing_message_id, headers
+    references_out = _build_references_header(references, incoming_message_id)
+    if references_out:
+        headers["References"] = references_out
+
+    return (
+        OutgoingEmail(
+            to=to,
+            from_address=from_address,
+            subject=_subject_for_reply(subject),
+            body=body,
+            headers=headers,
+        ),
+        outgoing_message_id,
+    )
 
 
-# --------------------------------------------------------------------------- #
-# Storage
-# --------------------------------------------------------------------------- #
-
-
-def _content_parts_for_storage(
-    incoming: IncomingEmail,
-    media_root: Path | None,
-) -> list[tuple[str, str]]:
+def _content_parts_for_storage(incoming: IncomingEmail, media_root: Path | None) -> list[tuple[str, str]]:
     stored: list[tuple[str, str]] = []
     for part in incoming.content_parts:
         if part.kind == "text":
@@ -317,6 +339,7 @@ def store_incoming_email(
     incoming: IncomingEmail,
     whitelist: set[str] | list[str],
     media_root: Path | None = None,
+    imap_identifier: str | None = None,
 ) -> dict:
     sender = normalize_sender(incoming.from_header)
     normalized_whitelist = {s.strip().lower() for s in whitelist}
@@ -326,19 +349,13 @@ def store_incoming_email(
     incoming_message_id = normalize_message_id(incoming.message_id)
     in_reply_to = normalize_message_id(incoming.in_reply_to)
     references = normalize_references(incoming.references)
-
-    if incoming_message_id and db.has_incoming_email_message_id(conn, incoming_message_id):
-        return {"status": "ignored_duplicate_message"}
-
-    thread_id = db.resolve_email_thread_from_references(
-        conn,
+    thread_id = resolve_thread_id(
         sender_id=sender,
+        incoming_message_id=incoming_message_id,
         in_reply_to=in_reply_to,
         references=references,
     )
     created_ts = db.convert_to_local_iso(incoming.timestamp)
-    if thread_id is None:
-        thread_id = db.create_email_thread(conn, sender_id=sender, created_ts=created_ts)
 
     content_parts = _content_parts_for_storage(incoming, media_root)
     if not content_parts:
@@ -347,56 +364,30 @@ def store_incoming_email(
     message_row_id = db.insert_message_with_content(
         conn,
         channel="email",
-        thread_id=str(thread_id),
+        thread_id=thread_id,
         sender_id=sender,
         role="user",
         timestamp=created_ts,
         content_parts=content_parts,
     )
-    db.insert_email_message_meta(
-        conn,
-        message_id=message_row_id,
-        email_message_id=incoming_message_id,
-        in_reply_to=in_reply_to,
-        references_header=" ".join(references) if references else None,
-        subject=incoming.subject,
-        process_state=db.PENDING,
-    )
 
+    transport = EmailTransportData(
+        imap_identifier=imap_identifier,
+        incoming_message_id=incoming_message_id,
+        in_reply_to=in_reply_to,
+        references=" ".join(references) if references else None,
+        subject=incoming.subject,
+        sender_id=sender,
+        thread_id=thread_id,
+    )
     return {
         "status": "queued",
         "sender": sender,
-        "email_thread_id": thread_id,
+        "thread_id": thread_id,
         "incoming_message_id": incoming_message_id,
         "message_id": message_row_id,
+        "transport": transport,
     }
-
-
-def build_reply_email(
-    *,
-    from_address: str,
-    incoming: IncomingEmail,
-    to: str,
-    body: str,
-    generated_message_id: str | None = None,
-) -> tuple[OutgoingEmail, str]:
-    incoming_message_id = normalize_message_id(incoming.message_id)
-    references = normalize_references(incoming.references)
-    outgoing_message_id, headers = _build_outgoing_headers(
-        incoming_message_id=incoming_message_id,
-        references=references,
-        generated_message_id=generated_message_id,
-    )
-    return (
-        OutgoingEmail(
-            to=to,
-            from_address=from_address,
-            subject=_subject_for_reply(incoming.subject),
-            body=body,
-            headers=headers,
-        ),
-        outgoing_message_id,
-    )
 
 
 def send_reply_smtp(outgoing: OutgoingEmail, smtp_config: SMTPConfigProtocol) -> None:
@@ -424,13 +415,49 @@ def _open_imap_connection(imap_config: IMAPConfigProtocol):
     return imaplib.IMAP4(imap_config.host, imap_config.port)
 
 
+def _extract_response_bytes(response) -> bytes | None:
+    if not response:
+        return None
+    for item in response:
+        if isinstance(item, tuple) and len(item) > 1 and isinstance(item[1], (bytes, bytearray)):
+            return bytes(item[1])
+    return None
+
+
+def _fetch_uid_bytes(client, uid: bytes, query: str) -> bytes | None:
+    status, fetched = client.uid("FETCH", uid, query)
+    if status != "OK":
+        return None
+    return _extract_response_bytes(fetched)
+
+
+def _move_to_mailbox(client, uid: bytes, mailbox: str) -> None:
+    status, _ = client.uid("MOVE", uid, mailbox)
+    if status == "OK":
+        return
+    status, _ = client.uid("COPY", uid, mailbox)
+    if status != "OK":
+        raise IMAPPollError(f"Failed to move message to mailbox {mailbox!r}")
+    status, _ = client.uid("STORE", uid, "+FLAGS.SILENT", r"(\\Deleted)")
+    if status != "OK":
+        raise IMAPPollError("Failed to mark source message deleted after copy fallback")
+    client.expunge()
+
+
+def _sender_from_header_bytes(header_bytes: bytes) -> str | None:
+    parsed = message_from_bytes(header_bytes, policy=policy.default)
+    return normalize_sender(parsed.get("From", ""))
+
+
 def poll_inbox(
     *,
     conn,
     whitelist: set[str] | list[str],
     imap_config: IMAPConfigProtocol,
+    spam_mailbox: str,
     media_root: Path | None = None,
 ) -> list[dict]:
+    normalized_whitelist = {s.strip().lower() for s in whitelist}
     try:
         with _open_imap_connection(imap_config) as client:
             client.login(imap_config.username, imap_config.password)
@@ -438,102 +465,37 @@ def poll_inbox(
             if status != "OK":
                 raise IMAPPollError(f"Failed to select inbox {imap_config.inbox!r}")
 
-            status, data = client.search(None, "ALL")
+            status, data = client.search(None, "UNSEEN")
             if status != "OK":
                 raise IMAPPollError("Failed to search inbox")
 
             results: list[dict] = []
-            for raw_id in data[0].split():
-                status, fetched = client.fetch(raw_id, "(RFC822)")
-                if status != "OK" or not fetched or fetched[0] is None:
+            for uid in data[0].split():
+                header_bytes = _fetch_uid_bytes(client, uid, "(BODY.PEEK[HEADER.FIELDS (FROM)])")
+                if not header_bytes:
                     continue
-                payload = fetched[0][1]
+                sender = _sender_from_header_bytes(header_bytes)
+                if not sender or sender not in normalized_whitelist:
+                    _move_to_mailbox(client, uid, spam_mailbox)
+                    results.append({"status": "moved_to_spam", "sender": sender})
+                    continue
+
+                payload = _fetch_uid_bytes(client, uid, "(RFC822)")
                 if not isinstance(payload, (bytes, bytearray)):
                     continue
                 incoming = parse_mime_message(bytes(payload))
                 result = store_incoming_email(
                     conn=conn,
                     incoming=incoming,
-                    whitelist=whitelist,
+                    whitelist=normalized_whitelist,
                     media_root=media_root,
+                    imap_identifier=uid.decode("ascii", errors="ignore"),
                 )
+                if result.get("status") == "queued":
+                    client.uid("STORE", uid, "+FLAGS.SILENT", r"(\\Seen)")
                 results.append(result)
-                client.store(raw_id, "+FLAGS", "\\Seen")
             return results
     except IMAPPollError:
         raise
     except Exception as exc:  # noqa: BLE001
         raise IMAPPollError(str(exc)) from exc
-
-
-def process_incoming_email(
-    *,
-    conn,
-    incoming: IncomingEmail,
-    whitelist: set[str] | list[str],
-    run_agent: Callable[[list[dict], dict], str],
-    send_reply: Callable[[OutgoingEmail], None],
-    generated_message_id: str | None = None,
-    from_address: str = "podhead@example.com",
-    media_root: Path | None = None,
-) -> dict:
-    """Store, run agent, send reply, store reply."""
-    result = store_incoming_email(
-        conn=conn, incoming=incoming, whitelist=whitelist, media_root=media_root
-    )
-    if result["status"] != "queued":
-        return result
-
-    thread_id = str(result["email_thread_id"])
-    history = db.get_conversation(conn, "email", thread_id)
-    message_id = result["message_id"]
-    db.update_email_message_state(conn, message_id, db.PROCESSING)
-
-    current_message = next(m for m in history if m["id"] == message_id)
-
-    try:
-        assistant_text = run_agent(history, current_message)
-
-        meta = db.get_email_message_meta(conn, message_id)
-        temp_incoming = IncomingEmail(
-            from_header=result["sender"],
-            subject=(meta.get("subject") if meta else None) or incoming.subject,
-            content_parts=[],
-            message_id=meta.get("email_message_id") if meta else None,
-            in_reply_to=meta.get("in_reply_to") if meta else None,
-            references=meta.get("references_header") if meta else None,
-        )
-        outgoing, outgoing_message_id = build_reply_email(
-            from_address=from_address,
-            incoming=temp_incoming,
-            to=result["sender"],
-            body=assistant_text,
-            generated_message_id=generated_message_id,
-        )
-        send_reply(outgoing)
-
-        ts = db.now_local_iso()
-        asst_message_id = db.insert_message_with_content(
-            conn,
-            channel="email",
-            thread_id=thread_id,
-            sender_id="assistant",
-            role="assistant",
-            timestamp=ts,
-            content_parts=[("text", assistant_text)],
-        )
-        db.insert_email_message_meta(
-            conn,
-            message_id=asst_message_id,
-            email_message_id=outgoing_message_id,
-            subject=outgoing.subject,
-            process_state=db.COMPLETED,
-        )
-        db.update_email_message_state(conn, message_id, db.COMPLETED)
-    except Exception as exc:  # noqa: BLE001
-        db.update_email_message_state(conn, message_id, db.FAILED, str(exc))
-        raise
-
-    result["status"] = "processed"
-    result["outgoing_message_id"] = outgoing_message_id
-    return result

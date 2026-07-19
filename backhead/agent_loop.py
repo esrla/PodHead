@@ -35,42 +35,6 @@ def tool_error_result(
     }
 
 
-# --------------------------------------------------------------------------- #
-# Secret redaction
-# --------------------------------------------------------------------------- #
-
-# Matches secret-like JSON field names (used in _redact_secrets below).
-_SECRET_FIELD_NAMES = (
-    r"api[_-]?key|password|passwd|secret|token|auth(?:orization)?"
-    r"|bearer|credential|private[_-]?key|access[_-]?token|refresh[_-]?token|cookie"
-)
-_SECRET_JSON_FIELD_RE = re.compile(
-    rf'("(?:{_SECRET_FIELD_NAMES})"\s*:\s*)"[^"]*"',
-    re.IGNORECASE,
-)
-_SECRET_AUTH_HEADER_RE = re.compile(
-    r"(Authorization:\s*(?:Bearer|Basic)\s+)\S+",
-    re.IGNORECASE,
-)
-
-
-def _redact_secrets(text: str, known_secrets: list[str] | None = None) -> str:
-    """Redact known secrets and common secret patterns from text."""
-    result = text
-    if known_secrets:
-        for secret in known_secrets:
-            if secret and len(secret) > 4:
-                result = result.replace(secret, "[REDACTED]")
-    result = _SECRET_JSON_FIELD_RE.sub(r'\1"[REDACTED]"', result)
-    result = _SECRET_AUTH_HEADER_RE.sub(r"\1[REDACTED]", result)
-    return result
-
-
-# --------------------------------------------------------------------------- #
-# Execution tree
-# --------------------------------------------------------------------------- #
-
-
 @dataclass
 class ToolRecord:
     name: str
@@ -91,18 +55,27 @@ def _preview(text: str, max_chars: int = 100) -> str:
     return text[:max_chars] + "... [truncated]"
 
 
-def _format_args_display(args_json: str, known_secrets: list[str] | None = None) -> str:
-    """Format tool arguments for display, redacting secrets."""
-    return _redact_secrets(args_json, known_secrets)
+def _sanitize_for_preview(value: Any) -> Any:
+    if isinstance(value, (bytes, bytearray)):
+        return "[binary data omitted]"
+    if isinstance(value, dict):
+        return {k: _sanitize_for_preview(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_for_preview(v) for v in value]
+    return value
 
 
-def _format_result_preview(result: Any, known_secrets: list[str] | None = None) -> str:
-    """Format tool result as a redacted preview."""
-    if isinstance(result, (dict, list)):
-        text = json.dumps(result)
+def _format_args_display(args_json: str) -> str:
+    return args_json
+
+
+def _format_result_preview(result: Any) -> str:
+    if isinstance(result, (bytes, bytearray)):
+        text = "[binary data omitted]"
+    elif isinstance(result, (dict, list)):
+        text = json.dumps(_sanitize_for_preview(result))
     else:
         text = str(result)
-    text = _redact_secrets(text, known_secrets)
     return _preview(text)
 
 
@@ -146,7 +119,7 @@ def build_execution_tree(agent: "Agent", final_reply: str) -> str | None:
     if not agent._tool_records:
         return None
     lines = _build_tree_lines("Main agent", agent._tool_records)
-    return "\n".join(lines)
+    return "[System-generated execution tree]\n" + "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
@@ -228,7 +201,6 @@ class Agent:
         depth: int = 0,
         max_depth: int = 2,
         max_children: int = 4,
-        known_secrets: list[str] | None = None,
     ) -> None:
         self.openai_client = openai_client
         self.model = model
@@ -240,7 +212,6 @@ class Agent:
         self.depth = depth
         self.max_depth = max_depth
         self.max_children = max_children
-        self.known_secrets: list[str] = list(known_secrets or [])
         self._tool_records: list[ToolRecord] = []
         self._final_reply: str = ""
         self._children_spawned = 0
@@ -364,8 +335,8 @@ class Agent:
         self._tool_records.append(
             ToolRecord(
                 name=tool_name,
-                args_display=_format_args_display(args_json, self.known_secrets),
-                result_preview=_format_result_preview(result, self.known_secrets),
+                args_display=_format_args_display(args_json),
+                result_preview=_format_result_preview(result),
                 child_agent=child_agent,
             )
         )
