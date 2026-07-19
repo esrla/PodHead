@@ -4,17 +4,13 @@ PodHead is an email-driven agent backend with a strict split between backend cod
 
 ## Backend entrypoint
 
-Start the backend with:
+PodHead has one user-facing startup command:
 
 ```bash
 python -m backhead.main
 ```
 
-Run bootstrap with:
-
-```bash
-python -m backhead.main --bootstrap
-```
+Backend startup bootstraps the runtime automatically before entering the normal mail loop.
 
 ## Configuration
 
@@ -64,7 +60,7 @@ The backend verifies that:
 
 - the configured container exists
 - the container is running
-- `head_pod/workspace` is mounted to `/workspace`
+- `head_pod` is mounted to `/workspace`
 - backend code and `backhead/private_config.py` are not mounted into the container
 - `/workspace/AGENT.md` exists inside the container
 

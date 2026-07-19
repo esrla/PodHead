@@ -1,10 +1,8 @@
-"""PodHead backend entrypoint."""
+"""PodHead backend runtime loop."""
 
 from __future__ import annotations
 
-import argparse
 import asyncio
-from pathlib import Path
 import sqlite3
 import subprocess
 import threading
@@ -13,27 +11,19 @@ from typing import Any, Callable
 from backhead import db, mail
 from backhead import media as media_mod
 from backhead.agent_loop import Agent, DEFAULT_SYSTEM_PROMPT, messages_to_openai_messages
-from backhead.llm import create_openai_client, test_openai_endpoint
+from backhead.bootstrap import ensure_runtime
+from backhead.bootstrap import open_db_connection
+from backhead.bootstrap import STATE_DIR
+from backhead.llm import create_openai_client
 from backhead.private_config import CONFIG, AppConfig
 from backhead.tools.cli_tool import create_cli_tool
 from backhead.tools.spawn_subagent import create_spawn_subagent_tool
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-STATE_DIR = REPO_ROOT / "state"
-DB_PATH = STATE_DIR / "agent.db"
 MEDIA_ROOT = STATE_DIR
-CONTAINER_IMAGE_NAME = "podhead-agent-image"
-WORKSPACE_HOST_PATH = (REPO_ROOT / "head_pod" / "workspace").resolve()
-PRIVATE_CONFIG_PATH = Path(__file__).resolve().parent / "private_config.py"
-BACKEND_PATH = (REPO_ROOT / "backhead").resolve()
 
 
 class ContainerExecutionError(RuntimeError):
     error_type = "container_execution_error"
-
-
-class PodmanVerificationError(RuntimeError):
-    pass
 
 
 class RuntimeContext:
@@ -50,19 +40,6 @@ class RuntimeContext:
 def _db_call(runtime: RuntimeContext, func: Callable[..., Any], *args, **kwargs):
     with runtime.db_lock:
         return func(runtime.conn, *args, **kwargs)
-
-
-
-def ensure_state_dir() -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-
-
-
-def open_db_connection(path: Path = DB_PATH) -> sqlite3.Connection:
-    ensure_state_dir()
-    conn = sqlite3.connect(path, check_same_thread=False)
-    db.init_db(conn)
-    return conn
 
 
 
@@ -155,61 +132,6 @@ def create_podman_runner(container_name: str, timeout_seconds: int = 300):
 
 
 
-def _podman_inspect(name: str) -> dict:
-    completed = subprocess.run(
-        ["podman", "inspect", name],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if completed.returncode != 0:
-        raise PodmanVerificationError(completed.stderr.strip() or f"Container {name!r} does not exist.")
-    import json
-
-    items = json.loads(completed.stdout)
-    if not items:
-        raise PodmanVerificationError(f"Container {name!r} does not exist.")
-    return items[0]
-
-
-
-def verify_container_environment(config: AppConfig) -> None:
-    inspect = _podman_inspect(config.podman_container_name)
-    state = inspect.get("State") or {}
-    if not state.get("Running"):
-        raise PodmanVerificationError(f"Container {config.podman_container_name!r} is not running.")
-
-    mounts = inspect.get("Mounts") or []
-    workspace_mount = None
-    for mount in mounts:
-        destination = Path(mount.get("Destination", ""))
-        source = Path(mount.get("Source", "")).resolve()
-        if destination == Path("/workspace"):
-            workspace_mount = source
-    if workspace_mount != WORKSPACE_HOST_PATH:
-        raise PodmanVerificationError("Expected head_pod/workspace to be mounted at /workspace.")
-
-    forbidden_sources = {PRIVATE_CONFIG_PATH, BACKEND_PATH, REPO_ROOT}
-    for mount in mounts:
-        source = Path(mount.get("Source", "")).resolve()
-        if source == WORKSPACE_HOST_PATH:
-            continue
-        if source in forbidden_sources:
-            raise PodmanVerificationError(f"Forbidden mount detected: {source}")
-        if BACKEND_PATH in source.parents or PRIVATE_CONFIG_PATH.parent in source.parents:
-            raise PodmanVerificationError(f"Forbidden parent mount detected: {source}")
-
-    completed = subprocess.run(
-        ["podman", "exec", config.podman_container_name, "test", "-f", "/workspace/AGENT.md"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if completed.returncode != 0:
-        raise PodmanVerificationError("/workspace/AGENT.md is missing inside the container.")
-
-
-
 def create_tooling(*, config: AppConfig, container_runner):
     main_client = create_openai_client(config.main_agent.base_url, config.main_agent.api_key)
     sub_client = create_openai_client(config.subagent.base_url, config.subagent.api_key)
@@ -256,86 +178,6 @@ def _message_to_incoming_email(row: dict, sender: str) -> mail.IncomingEmail:
     )
 
 
-
-
-
-def validate_config(config: AppConfig) -> None:
-    placeholder_values = {
-        config.main_agent.api_key,
-        config.main_agent.model,
-        config.subagent.api_key,
-        config.subagent.model,
-        config.email_account.password,
-        config.imap.password,
-        config.smtp.password,
-    }
-    if any(value.startswith("replace-") for value in placeholder_values):
-        raise ValueError("Replace the demonstration values in backhead/private_config.py before running PodHead.")
-
-def bootstrap(config: AppConfig = CONFIG) -> None:
-    validate_config(config)
-    subprocess.run(["podman", "--version"], check=True, capture_output=True, text=True)
-    ensure_state_dir()
-    subprocess.run(
-        ["podman", "build", "-t", CONTAINER_IMAGE_NAME, "-f", str(REPO_ROOT / "Containerfile"), str(REPO_ROOT)],
-        check=True,
-    )
-
-    exists = subprocess.run(
-        ["podman", "container", "exists", config.podman_container_name],
-        check=False,
-    )
-    if exists.returncode == 0:
-        subprocess.run(["podman", "rm", "-f", config.podman_container_name], check=True)
-
-    subprocess.run(
-        [
-            "podman",
-            "create",
-            "--name",
-            config.podman_container_name,
-            "--mount",
-            f"type=bind,src={WORKSPACE_HOST_PATH},dst=/workspace",
-            CONTAINER_IMAGE_NAME,
-        ],
-        check=True,
-    )
-    subprocess.run(["podman", "start", config.podman_container_name], check=True)
-
-    conn = open_db_connection()
-    conn.close()
-
-    main_client = create_openai_client(config.main_agent.base_url, config.main_agent.api_key)
-    sub_client = create_openai_client(config.subagent.base_url, config.subagent.api_key)
-    test_openai_endpoint(main_client, config.main_agent.model)
-    test_openai_endpoint(sub_client, config.subagent.model)
-
-    _test_imap(config)
-    _test_smtp(config)
-    verify_container_environment(config)
-
-
-
-def _test_imap(config: AppConfig) -> None:
-    client = mail._open_imap_connection(config.imap)
-    try:
-        client.login(config.imap.username, config.imap.password)
-        status, _ = client.select(config.imap.inbox)
-        if status != "OK":
-            raise RuntimeError(f"Failed to select inbox {config.imap.inbox!r}")
-    finally:
-        try:
-            client.logout()
-        except Exception:  # noqa: BLE001
-            pass
-
-
-
-def _test_smtp(config: AppConfig) -> None:
-    with mail.smtplib.SMTP(config.smtp.host, config.smtp.port, timeout=30) as smtp:
-        if config.smtp.use_tls:
-            smtp.starttls()
-        smtp.login(config.smtp.username, config.smtp.password)
 
 
 
@@ -452,8 +294,6 @@ async def poll_and_schedule(runtime: RuntimeContext, run_agent, container_runner
 
 
 async def run_backend(config: AppConfig = CONFIG) -> None:
-    validate_config(config)
-    verify_container_environment(config)
     conn = open_db_connection()
     runtime = RuntimeContext(config, conn)
     await asyncio.to_thread(_db_call, runtime, db.reset_processing_email_messages)
@@ -477,13 +317,8 @@ async def run_backend(config: AppConfig = CONFIG) -> None:
 
 
 
-def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Run the PodHead backend.")
-    parser.add_argument("--bootstrap", action="store_true", help="Build and verify the runtime environment.")
-    args = parser.parse_args(argv)
-    if args.bootstrap:
-        bootstrap(CONFIG)
-        return
+def main() -> None:
+    ensure_runtime(CONFIG)
     asyncio.run(run_backend(CONFIG))
 
 

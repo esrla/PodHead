@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parents[1] / "head_pod" / "workspace" / "tools"))
+sys.path.insert(0, str(Path(__file__).parents[1] / "head_pod" / "tools"))
 from find_skill import (
     EMBED_FILENAME,
     _load_or_create_embedding,
