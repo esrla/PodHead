@@ -202,7 +202,7 @@ def parse_mime_message(raw_message: bytes) -> IncomingEmail:
     if date_str:
         try:
             timestamp = parsedate_to_datetime(date_str.strip()).timestamp()
-        except Exception:  # noqa: BLE001
+        except (TypeError, ValueError):
             timestamp = None
     return IncomingEmail(
         from_header=parsed.get("From", ""),

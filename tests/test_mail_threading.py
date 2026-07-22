@@ -445,7 +445,6 @@ def test_audio_video_stored_as_text_parts():
 
 
 def test_parse_mime_date_header_with_timezone():
-    import datetime as _dt
     msg = EmailMessage()
     msg["From"] = "alice@example.com"
     msg["Date"] = "Mon, 01 Jan 2024 12:00:00 +0200"
@@ -453,8 +452,8 @@ def test_parse_mime_date_header_with_timezone():
     result = parse_mime_message(msg.as_bytes())
     assert result.timestamp is not None
     assert isinstance(result.timestamp, float)
-    expected = _dt.datetime(2024, 1, 1, 10, 0, 0,
-                            tzinfo=_dt.timezone.utc).timestamp()
+    expected = datetime.datetime(2024, 1, 1, 10, 0, 0,
+                                 tzinfo=datetime.timezone.utc).timestamp()
     assert abs(result.timestamp - expected) < 2.0
 
 
@@ -495,17 +494,16 @@ def test_store_email_with_date_uses_parsed_timestamp():
 
 def test_missing_date_falls_back_to_current_time():
     """When Date is absent the stored timestamp must be close to now."""
-    import datetime as _dt
     conn = _conn()
-    before = _dt.datetime.now().astimezone().replace(microsecond=0)
+    before = datetime.datetime.now().astimezone().replace(microsecond=0)
     result = store_incoming_email(
         conn=conn,
         incoming=_text_email("alice@example.com", "no date", "body",
                               message_id="<nodate@example.com>"),
         whitelist={"alice@example.com"},
     )
-    after = _dt.datetime.now().astimezone() + _dt.timedelta(seconds=1)
+    after = datetime.datetime.now().astimezone() + datetime.timedelta(seconds=1)
     assert result["status"] == "queued"
     convo = db.get_conversation(conn, "email", result["thread_id"])
-    stored = _dt.datetime.fromisoformat(convo[0]["timestamp"])
+    stored = datetime.datetime.fromisoformat(convo[0]["timestamp"])
     assert before <= stored <= after
