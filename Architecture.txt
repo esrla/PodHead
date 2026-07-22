@@ -135,6 +135,7 @@ Notes:
 10) Tools / scripts model
 - Built-in runtime capability: run_cli executes commands inside the Podman workspace container.
 - spawn_subagent: spawns a fresh Agent context for a subtask; child prompt is the only model-provided parameter.
+- embed_text: backend tool that returns a normalized semantic embedding vector for the given text; the computation runs entirely inside the trusted backend, not in the container.
 - Everything else is implemented as scripts under head_pod/tools/ and executed via run_cli.
 - head_pod/tools/tools.md is the registry of scripts and how to invoke them (maintained by the agent).
 
@@ -171,7 +172,25 @@ spawn_subagent contract:
   - that tools/tools.md must be updated when creating new scripts
 
 
-13) Error handling
+13) Skill-header sidecars (must be on backend side)
+- Before each incoming user message is dispatched to the main LLM, the trusted backend generates a skill-header sidecar.
+- The sidecar queries the skills/ directory in the workspace and selects the top-N skills most relevant to the message text.
+- Relevance is determined by cosine similarity between a normalized embedding of the message text and each skill's cached embedding.
+- Skills are ranked and the top matches are formatted as a compact block of names and descriptions.
+- The sidecar is injected into the system prompt for the current turn only; prior conversation turns are not affected.
+- Skill embeddings are cached beside their SKILL.md as .embed.npy; the cache is invalidated whenever SKILL.md is newer than the cache file.
+- If the workspace has no skills/ directory, or the directory contains no valid SKILL.md files, no sidecar is generated and the system prompt is unmodified.
+- If sidecar generation raises an exception the backend falls back silently and dispatches the message with the unmodified system prompt.
+- The sidecar is generated entirely inside the trusted backend; the agent workspace is read but never written during sidecar generation.
+
+embed_text backend tool contract:
+- Input: text (string)
+- Output: {"ok": true, "embedding": [float, ...]} — a normalized embedding vector
+- The computation runs in the trusted backend; the container never has direct model access.
+- Both the main agent and subagents may call embed_text.
+
+
+14) Error handling
 - Runtime errors are logged or returned through current error handling.
 - main.py wraps each agent turn in try/except.
 - On exception: send user-friendly error email.
@@ -180,12 +199,12 @@ spawn_subagent contract:
 - No persistent email processing state exists.
 
 
-14) Self-extension
+15) Self-extension
 - The agent may create new scripts under /workspace/tools/ (inside the container, backed by head_pod/tools/ on the host).
 - Every new script must be registered in tools/tools.md with purpose and exact CLI invocation examples.
 
 
-15) Repository layout
+16) Repository layout
 
 One Git repo contains:
 - backhead/ (backend runtime code)
@@ -220,7 +239,7 @@ Access rules:
 - Agent must not access backhead/ or private config.
 
 
-16) Backend API (internal modules)
+17) Backend API (internal modules)
 Core operations:
 - poll_inbox(conn, whitelist, imap_config, spam_mailbox, media_root, db_lock) -> list[dict]
 - store_incoming_email(conn, incoming, whitelist, media_root, imap_identifier) -> dict
@@ -232,9 +251,11 @@ Core operations:
 - messages_to_openai_messages(conversation, media_root) -> list[dict]
 - save_image(data, media_root) -> str | None
 - load_image_as_base64(relative_path, media_root) -> str | None
+- generate_skill_header(message_text, workspace_path, top) -> str | None
+- embed(texts) -> np.ndarray
 
 
-17) Installation
+18) Installation
 - See GETTING-STARTED.md for full setup.
 - Start with: python -m backhead.main
 - backhead.main automatically runs bootstrap before starting the backend.
@@ -242,7 +263,7 @@ Core operations:
 - It does not test the LLM, IMAP or SMTP services during startup.
 
 
-18) SQLite schema
+19) SQLite schema
 
 CREATE TABLE IF NOT EXISTS messages (
   id        INTEGER PRIMARY KEY AUTOINCREMENT,
