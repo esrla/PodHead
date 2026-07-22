@@ -1,0 +1,270 @@
+PODHEAD ARCHITECTURE — single-file spec
+
+# Rules of this file:
+- Never use wording new, updated etc.
+- Always include entire file
+- When user asks for this file, return the actual updated file and not just the content in a chat as text.
+
+
+
+1) Goal
+- Barebone always-on agent loop on Raspberry Pi (or any Linux host).
+- Communicate via triggers from one or more sources (initially: email).
+- Keep long conversations coherent using the full stored conversation log.
+- Run the agent's system-access (CLI/scripts) inside a container isolated from backend files.
+- Keep secrets and sensitive identity data (API keys, IMAP/SMTP creds, endpoints, whitelist, etc.) out of Git by placing them in backhead/private_config.py with placeholder values only.
+- Repo contains backend code and agent workspace, but no sensitive data.
+
+
+2) Runtime split
+- backhead/main.py is BACKEND (admin-owned): always-on loop and dispatcher.
+- backhead/agent_loop.py is BACKEND (admin-owned): runs one turn when main.py dispatches an inbound trigger.
+- Backend (admin-owned) provides:
+  - trigger polling (IMAP for email initially)
+  - outbound sending (SMTP for email initially)
+  - LLM proxy (chat completions)
+  - the SQLite database (append-only)
+  - attachment handling (decode/normalize images)
+  - agent CLI runner (run_cli in container)
+  - config loader (backhead/private_config.py)
+- head_pod workspace provides:
+  - AGENT.md
+  - preferences.md
+  - skills.md
+  - tools/ scripts
+- Agent must not access backend files; backend must not be exposed to the agent workspace.
+
+
+3) Hard rule: runtime always sends LLM output
+- The LLM does NOT decide whether an email is sent.
+- Every LLM text response is always emailed back to the triggering sender by the runtime.
+- The only exception-like behavior is attachments: images can be sent via an explicit LLM tool call.
+
+
+4) Agent class and construction
+
+Agent is a reusable stateful conversation object.
+- One instance owns one conversation history.
+- Separate instances never share history.
+- The main agent and subagents instantiate the same Agent class directly.
+- spawn_subagent creates a fresh Agent instance for a subtask.
+- Parent and child are instances of the same Agent class.
+- A subagent receives: a fresh history, a backend-selected client and model, the model-supplied child prompt, shared access to the same workspace and container, enforced depth and child limits.
+- All agents share one workspace/container.
+- OpenAI clients and models may differ between agent instances.
+- Email-agent histories are persisted in SQLite.
+- Subagent histories are not persisted.
+
+
+5) Email pipeline (per-message)
+1. Poll the inbox using IMAP UID UNSEEN.
+2. Fetch only the sender header using BODY.PEEK[HEADER.FIELDS (FROM)].
+3. Normalize the sender.
+4. If the sender is not whitelisted, move the message to the configured spam mailbox.
+5. If whitelisted, fetch the complete message using BODY.PEEK[].
+6. Parse and normalize ordered text and media content.
+7. Resolve the thread ID from a PodHead marker in In-Reply-To or References.
+8. For a new thread with a valid incoming Message-ID, derive the thread ID deterministically from sender and Message-ID.
+9. If no usable Message-ID exists, generate a unique new thread ID.
+10. Store the normalized user message atomically (acquire db_lock only around this insert).
+11. Explicitly mark the IMAP message Seen only after successful storage.
+12. Load conversation history ordered by database message ID.
+13. Merge consecutive messages with the same role.
+14. Run the agent and its in-memory tool loop.
+15. Inject the execution tree above the final response when tools were used.
+16. Store the final assistant message using the user's sender ID as metadata.
+17. Reply using the incoming Message-ID and references kept in memory.
+
+Notes:
+- Subject is not used for thread identity.
+- No persistent email deduplication table exists.
+- No persistent pending, retry or recovery queue exists.
+- Email transport metadata is not stored in SQLite.
+
+
+6) Whitelist
+- The whitelist is a list of normalized sender email addresses in backhead/private_config.py.
+- Whitelist validation happens before full MIME parsing.
+- Rejected senders are moved to the configured spam mailbox.
+
+
+7) Storage (SQLite in backend)
+- SQLite append-only log lives in backend-owned state directory.
+- The database stores a generic conversation log.
+
+messages table:
+- id: INTEGER PK (controls conversation order)
+- channel: TEXT
+- thread_id: TEXT
+- sender_id: TEXT
+- role: TEXT (user or assistant)
+- timestamp: TEXT
+
+message_content table:
+- id: INTEGER PK
+- message_id: INTEGER FK
+- ordinal: INTEGER (controls content order within a message)
+- content_type: TEXT (text or image)
+- content: TEXT
+
+Notes:
+- role is user or assistant.
+- assistant messages use the user's normalized sender ID as metadata in sender_id.
+- Message order is messages.id; content order is message_content.ordinal.
+- Timestamp is stored in the backend's local timezone with offset but does not control order.
+- Image content is a relative backend-owned media path; base64 is generated at the LLM boundary.
+- Consecutive same-role messages are merged during context construction.
+
+
+8) Chatlog construction for LLM (per conversation)
+- When a trigger arrives, route to one thread via thread_id.
+- Resolve with In-Reply-To first (PodHead thread marker).
+- If unresolved, inspect References newest to oldest (PodHead thread marker).
+- If no marker: derive thread ID deterministically from sender and Message-ID if available; otherwise generate a unique new thread ID.
+- Build history from the resolved thread_id only.
+- Prior rows (all except the newest incoming) are converted to OpenAI messages.
+- Agent is initialized with prior history; agent.run(incoming.body) adds the new prompt.
+- The incoming message is not duplicated in the context.
+
+
+9) Message sequencing
+- For the LLM prompt you must never output two consecutive same-role messages.
+- Consecutive same-role messages from the stored log are merged before constructing the prompt.
+
+
+10) Tools / scripts model
+- Built-in runtime capability: run_cli executes commands inside the Podman workspace container.
+- spawn_subagent: spawns a fresh Agent context for a subtask; child prompt is the only model-provided parameter.
+- Everything else is implemented as scripts under head_pod/tools/ and executed via run_cli.
+- head_pod/tools/tools.md is the registry of scripts and how to invoke them (maintained by the agent).
+
+run_cli contract:
+- Input: command (string)
+- Output: stdout/stderr as string
+- CLI is executed inside the Podman container with /workspace mounted from the configured host workspace path.
+- Agent environment must not contain backend files or private config.
+
+spawn_subagent contract:
+- Model provides: {"prompt": "..."}
+- Backend provides (via closure): OpenAI client, model, system prompt, tools, container runner, depth limits.
+- Child starts with fresh history; parent history is never copied.
+- Maximum depth and child count are enforced by the backend handler.
+
+
+11) Execution tree
+- A compact execution tree is injected above the final assistant response when tools were used.
+- Format: [System-generated execution tree] followed by the tree, then ---, then the reply.
+- Recursive nesting: subagent activity appears nested beneath its spawn_subagent call.
+- Multiple tool calls appear as sibling nodes.
+- Result previews are limited to 100 characters.
+- No execution tree is injected when no tools were used.
+- The exact combined response (tree + reply) is both sent and stored.
+- Tool calls and results exist only during the active agent run; they are not stored in SQLite.
+
+
+12) Preferences and skills (must be on agent side)
+- preferences.md: general behavioral preferences.
+- skills.md: operational rules and how to use this environment, including:
+  - how to edit preferences.md via CLI (overwrite entire file)
+  - how to edit skills.md via CLI (overwrite entire file)
+  - that scripts live under tools/
+  - that tools/tools.md must be updated when creating new scripts
+
+
+13) Error handling
+- Runtime errors are logged or returned through current error handling.
+- main.py wraps each agent turn in try/except.
+- On exception: send user-friendly error email.
+- Unfinished work is not recovered from SQLite after restart.
+- No database-backed retry queue exists.
+- No persistent email processing state exists.
+
+
+14) Self-extension
+- The agent may create new scripts under /workspace/tools/ (inside the container, backed by head_pod/tools/ on the host).
+- Every new script must be registered in tools/tools.md with purpose and exact CLI invocation examples.
+
+
+15) Repository layout
+
+One Git repo contains:
+- backhead/ (backend runtime code)
+- head_pod/ (agent workspace)
+- Containerfile, GETTING-STARTED.md, etc.
+- .gitignore rules that exclude runtime state
+
+Backend-owned runtime state (not committed):
+- state/
+  - agent.db (and WAL files)
+  - media/
+
+Private config (committed with placeholder values only):
+- backhead/private_config.py contains Python configuration classes.
+- Users replace placeholder values locally and must not commit real secrets.
+- Configurable values include: main agent endpoint, subagent endpoint, email account, IMAP, SMTP, sender whitelist, limits, Podman container name, workspace path, spam mailbox.
+
+Agent workspace (committed):
+- head_pod/
+  - AGENT.md
+  - preferences.md
+  - skills.md
+  - tools/
+    - tools.md
+    - *.py (scripts created by agent)
+
+Workspace is mounted into the container at /workspace. The host workspace path defaults to head_pod and is configurable.
+
+Access rules:
+- Backend reads and writes head_pod files directly on the host filesystem.
+- Agent can read/write only /workspace inside the container.
+- Agent must not access backhead/ or private config.
+
+
+16) Backend API (internal modules)
+Core operations:
+- poll_inbox(conn, whitelist, imap_config, spam_mailbox, media_root, db_lock) -> list[dict]
+- store_incoming_email(conn, incoming, whitelist, media_root, imap_identifier) -> dict
+- insert_message_with_content(conn, channel, thread_id, sender_id, role, timestamp, content_parts) -> int
+- get_conversation(conn, channel, thread_id) -> list[dict]
+- send_reply_smtp(outgoing, smtp_config) -> None
+- build_reply_email(...) -> (OutgoingEmail, message_id)
+- resolve_thread_id(sender_id, incoming_message_id, in_reply_to, references) -> str
+- messages_to_openai_messages(conversation, media_root) -> list[dict]
+- save_image(data, media_root) -> str | None
+- load_image_as_base64(relative_path, media_root) -> str | None
+
+
+17) Installation
+- See GETTING-STARTED.md for full setup.
+- Start with: python -m backhead.main
+- backhead.main automatically runs bootstrap before starting the backend.
+- Bootstrap prepares local runtime requirements: local directories, database, Podman image, container, workspace mount.
+- It does not test the LLM, IMAP or SMTP services during startup.
+
+
+18) SQLite schema
+
+CREATE TABLE IF NOT EXISTS messages (
+  id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  channel   TEXT NOT NULL,
+  thread_id TEXT NOT NULL,
+  sender_id TEXT NOT NULL,
+  role      TEXT NOT NULL,
+  timestamp TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS message_content (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  message_id   INTEGER NOT NULL,
+  ordinal      INTEGER NOT NULL,
+  content_type TEXT NOT NULL,
+  content      TEXT NOT NULL,
+  UNIQUE(message_id, ordinal),
+  FOREIGN KEY(message_id) REFERENCES messages(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_messages_channel_thread
+  ON messages(channel, thread_id, id);
+
+CREATE INDEX IF NOT EXISTS idx_message_content_message
+  ON message_content(message_id, ordinal);
