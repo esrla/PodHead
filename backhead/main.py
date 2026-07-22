@@ -233,19 +233,19 @@ async def schedule_conversation(runtime: RuntimeContext, thread_id: str, run_age
         task.add_done_callback(_cleanup)
 
 
-def _poll_inbox_with_db_lock(runtime: RuntimeContext) -> list[dict]:
-    with runtime.db_lock:
-        return mail.poll_inbox(
-            conn=runtime.conn,
-            whitelist=runtime.config.sender_whitelist,
-            imap_config=runtime.config.imap,
-            spam_mailbox=runtime.config.spam_mailbox,
-            media_root=MEDIA_ROOT,
-        )
+def _poll_inbox(runtime: RuntimeContext) -> list[dict]:
+    return mail.poll_inbox(
+        conn=runtime.conn,
+        whitelist=runtime.config.sender_whitelist,
+        imap_config=runtime.config.imap,
+        spam_mailbox=runtime.config.spam_mailbox,
+        media_root=MEDIA_ROOT,
+        db_lock=runtime.db_lock,
+    )
 
 
 async def poll_and_schedule(runtime: RuntimeContext, run_agent) -> None:
-    results = await asyncio.to_thread(_poll_inbox_with_db_lock, runtime)
+    results = await asyncio.to_thread(_poll_inbox, runtime)
     queued_by_thread: dict[str, list[QueuedEmailJob]] = defaultdict(list)
     for result in results:
         if result.get("status") != "queued":
