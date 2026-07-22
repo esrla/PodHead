@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 from email import message_from_bytes, policy
 from email.message import EmailMessage, Message
-from email.utils import formataddr, make_msgid, parseaddr
+from email.utils import formataddr, make_msgid, parseaddr, parsedate_to_datetime
 from html.parser import HTMLParser
 import hashlib
 import imaplib
@@ -151,12 +152,7 @@ def resolve_thread_id(
             return decoded
     if incoming_message_id:
         return deterministic_thread_id(sender_id, incoming_message_id)
-    fallback_source = json.dumps(
-        {"sender_id": sender_id, "in_reply_to": in_reply_to, "references": references},
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(fallback_source).hexdigest()
+    return secrets.token_hex(32)
 
 
 class _TextExtractor(HTMLParser):
@@ -201,6 +197,13 @@ def _content_id(part: Message) -> str | None:
 def parse_mime_message(raw_message: bytes) -> IncomingEmail:
     parsed = message_from_bytes(raw_message, policy=policy.default)
     parts = _extract_content_parts(parsed)
+    date_str = parsed.get("Date")
+    timestamp = None
+    if date_str:
+        try:
+            timestamp = parsedate_to_datetime(date_str.strip()).timestamp()
+        except (TypeError, ValueError):
+            timestamp = None
     return IncomingEmail(
         from_header=parsed.get("From", ""),
         subject=parsed.get("Subject", ""),
@@ -208,7 +211,7 @@ def parse_mime_message(raw_message: bytes) -> IncomingEmail:
         message_id=parsed.get("Message-ID"),
         in_reply_to=parsed.get("In-Reply-To"),
         references=parsed.get("References"),
-        timestamp=None,
+        timestamp=timestamp,
     )
 
 
@@ -258,9 +261,9 @@ def _extract_content_parts(message: Message) -> list[ContentPart]:
             if payload:
                 parts.append(ContentPart(kind="image_bytes", image_bytes=payload, mime_type=ctype))
         elif maintype == "audio":
-            parts.append(ContentPart(kind="audio_placeholder", text="[audio attachment omitted]"))
+            parts.append(ContentPart(kind="text", text="Audio detected. STT not yet implemented"))
         elif maintype == "video":
-            parts.append(ContentPart(kind="video_placeholder", text="[video attachment omitted]"))
+            parts.append(ContentPart(kind="text", text="Video detected. Video normalization not yet implemented"))
 
     if not have_plain_text and html_fallback:
         parts.insert(0, ContentPart(kind="text", text=html_fallback))
@@ -328,9 +331,6 @@ def _content_parts_for_storage(incoming: IncomingEmail, media_root: Path | None)
     stored: list[tuple[str, str]] = []
     for part in incoming.content_parts:
         if part.kind == "text":
-            if part.text:
-                stored.append(("text", part.text))
-        elif part.kind in ("audio_placeholder", "video_placeholder"):
             if part.text:
                 stored.append(("text", part.text))
         elif part.kind == "image_bytes":
@@ -468,7 +468,9 @@ def poll_inbox(
     imap_config: IMAPConfigProtocol,
     spam_mailbox: str,
     media_root: Path | None = None,
+    db_lock=None,
 ) -> list[dict]:
+    _lock = db_lock if db_lock is not None else contextlib.nullcontext()
     normalized_whitelist = {s.strip().lower() for s in whitelist}
     try:
         with _open_imap_connection(imap_config) as client:
@@ -477,7 +479,7 @@ def poll_inbox(
             if status != "OK":
                 raise IMAPPollError(f"Failed to select inbox {imap_config.inbox!r}")
 
-            status, data = client.search(None, "UNSEEN")
+            status, data = client.uid("SEARCH", None, "UNSEEN")
             if status != "OK":
                 raise IMAPPollError("Failed to search inbox")
 
@@ -492,20 +494,59 @@ def poll_inbox(
                     results.append({"status": "moved_to_spam", "sender": sender})
                     continue
 
-                payload = _fetch_uid_bytes(client, uid, "(RFC822)")
+                payload = _fetch_uid_bytes(client, uid, "(BODY.PEEK[])")
                 if not isinstance(payload, (bytes, bytearray)):
                     continue
                 incoming = parse_mime_message(bytes(payload))
-                result = store_incoming_email(
-                    conn=conn,
-                    incoming=incoming,
-                    whitelist=normalized_whitelist,
-                    media_root=media_root,
-                    imap_identifier=uid.decode("ascii", errors="ignore"),
+
+                # Prepare all data outside the lock
+                incoming_message_id = normalize_message_id(incoming.message_id)
+                in_reply_to = normalize_message_id(incoming.in_reply_to)
+                references = normalize_references(incoming.references)
+                thread_id = resolve_thread_id(
+                    sender_id=sender,
+                    incoming_message_id=incoming_message_id,
+                    in_reply_to=in_reply_to,
+                    references=references,
                 )
-                if result.get("status") == "queued":
-                    client.uid("STORE", uid, "+FLAGS.SILENT", r"(\\Seen)")
-                results.append(result)
+                created_ts = db.convert_to_local_iso(incoming.timestamp)
+                content_parts = _content_parts_for_storage(incoming, media_root)
+                if not content_parts:
+                    content_parts = [("text", "")]
+                uid_str = uid.decode("ascii", errors="ignore")
+
+                # Acquire lock only around the DB insertion
+                with _lock:
+                    message_row_id = db.insert_message_with_content(
+                        conn,
+                        channel="email",
+                        thread_id=thread_id,
+                        sender_id=sender,
+                        role="user",
+                        timestamp=created_ts,
+                        content_parts=content_parts,
+                    )
+
+                # Mark as Seen only after successful storage
+                client.uid("STORE", uid, "+FLAGS.SILENT", r"(\\Seen)")
+
+                transport = EmailTransportData(
+                    imap_identifier=uid_str,
+                    incoming_message_id=incoming_message_id,
+                    in_reply_to=in_reply_to,
+                    references=" ".join(references) if references else None,
+                    subject=incoming.subject,
+                    sender_id=sender,
+                    thread_id=thread_id,
+                )
+                results.append({
+                    "status": "queued",
+                    "sender": sender,
+                    "thread_id": thread_id,
+                    "incoming_message_id": incoming_message_id,
+                    "message_id": message_row_id,
+                    "transport": transport,
+                })
             return results
     except IMAPPollError:
         raise
