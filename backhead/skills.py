@@ -10,6 +10,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable
 
+import threading
+
 import numpy as np
 import yaml
 
@@ -17,14 +19,17 @@ SKILL_FILENAME = "SKILL.md"
 EMBED_FILENAME = ".embed.npy"
 _EMBED_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
 _model = None
+_model_lock = threading.Lock()
 
 
 def _get_model():
     global _model  # noqa: PLW0603
     if _model is None:
-        from sentence_transformers import SentenceTransformer  # noqa: PLC0415
+        with _model_lock:
+            if _model is None:
+                from sentence_transformers import SentenceTransformer  # noqa: PLC0415
 
-        _model = SentenceTransformer(_EMBED_MODEL_NAME)
+                _model = SentenceTransformer(_EMBED_MODEL_NAME)
     return _model
 
 

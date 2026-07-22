@@ -111,7 +111,8 @@ def build_email_agent_runner(
             if message_text:
                 try:
                     header = generate_skill_header(message_text, workspace_path)
-                except Exception:  # noqa: BLE001
+                except Exception as exc:  # noqa: BLE001
+                    print(f"Skill-header generation failed: {exc}")
                     header = None
                 if header:
                     augmented_system = f"{system_prompt}\n\n{header}"
