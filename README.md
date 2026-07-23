@@ -69,7 +69,7 @@ The backend verifies that:
 - backend code and `backhead/private_config.py` are not mounted into the container
 - `/workspace/AGENT.md` exists inside the container
 
-## Installation and tests
+## Installation
 
 Install backend and test dependencies from the repository root with:
 

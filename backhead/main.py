@@ -267,7 +267,7 @@ async def _send_request_error_response(
         )
         await asyncio.to_thread(mail.send_reply_smtp, outgoing, runtime.config.smtp)
     except Exception as exc:  # noqa: BLE001
-        print(f"Failed to send request error response for message {job.message_id} in thread {thread_id}: {exc}")
+        print(f"Failed to send email request error response for message {job.message_id} in thread {thread_id}: {exc}")
         return
 
     try:

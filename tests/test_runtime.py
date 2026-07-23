@@ -212,7 +212,7 @@ def test_fatal_request_error_is_replied_with_full_traceback_and_processing_conti
     assert history[3]["content"][0]["content"] == "reply:next"
 
 
-def test_send_request_error_response_logs_send_failures_without_retry(monkeypatch, capsys):
+def test_send_request_error_response_logged_when_send_fails(monkeypatch, capsys):
     conn = _conn()
     queued = _queue_message(conn, "alice@example.com", "<fail@example.com>", "fail", timestamp=1)
     runtime = RuntimeContext(_config(), conn)
@@ -225,7 +225,7 @@ def test_send_request_error_response_logs_send_failures_without_retry(monkeypatc
     asyncio.run(_send_request_error_response(runtime, QueuedEmailJob(queued["message_id"], queued["transport"]), queued["thread_id"], "trace"))
 
     captured = capsys.readouterr()
-    assert "Failed to send request error response" in captured.out
+    assert "Failed to send email request error response" in captured.out
     history = db.get_conversation(conn, "email", queued["thread_id"])
     assert [row["role"] for row in history] == ["user"]
 
