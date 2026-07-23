@@ -57,7 +57,8 @@ finding relevant content, or working alongside the skill search script.
 Use the skill search script to find the most relevant skill for a task:
 
 ```
-python /workspace/tools/find_skill.py '[0.1, 0.2, 0.3]'
+embed_text("your query here")
+python /workspace/tools/find_skill.py '[0.12, -0.34, ...]'
 ```
 
 The script reads the `name` and `description` from each `SKILL.md` frontmatter, generates
