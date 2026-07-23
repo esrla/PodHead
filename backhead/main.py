@@ -267,7 +267,10 @@ async def _send_request_error_response(
         )
         await asyncio.to_thread(mail.send_reply_smtp, outgoing, runtime.config.smtp)
     except Exception as exc:  # noqa: BLE001
-        print(f"Failed to send email request error response for message {job.message_id} in thread {thread_id}: {exc}")
+        print(
+            f"Failed to send email request error response for message {job.message_id} "
+            f"in thread {thread_id}: {exc!r}"
+        )
         return
 
     try:
@@ -284,7 +287,10 @@ async def _send_request_error_response(
             content_parts=[("text", error_text)],
         )
     except Exception as exc:  # noqa: BLE001
-        print(f"Failed to persist request error response for message {job.message_id} in thread {thread_id}: {exc}")
+        print(
+            f"Failed to persist request error response for message {job.message_id} "
+            f"in thread {thread_id}: {exc!r}"
+        )
 
 
 async def schedule_conversation(runtime: RuntimeContext, thread_id: str, run_agent) -> None:
