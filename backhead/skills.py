@@ -111,7 +111,8 @@ def _load_or_create_embedding(
     if embed_path.exists() and embed_path.stat().st_mtime >= skill_mtime:
         try:
             return _load_sidecar_embedding(embed_path, expected_dimensions=expected_dimensions)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            print(f"Deleting invalid skill sidecar {embed_path}: {exc}")
             _delete_sidecar(embed_path)
 
     return _create_sidecar_embedding(skill, embed_fn, expected_dimensions=expected_dimensions)

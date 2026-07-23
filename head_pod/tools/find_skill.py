@@ -88,7 +88,8 @@ def _load_embedding(skill, expected_dimensions=None):
             np.load(embed_path, allow_pickle=False),
             expected_dimensions=expected_dimensions,
         )
-    except Exception:
+    except Exception as exc:
+        print(f"Deleting invalid skill sidecar {embed_path}: {exc}", file=sys.stderr)
         _delete_sidecar(embed_path)
         raise
 

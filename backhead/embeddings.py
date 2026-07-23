@@ -15,7 +15,7 @@ def create_openai_embed_fn(openai_client: Any, model: str) -> Callable[[list[str
         rows = sorted(response.data, key=lambda item: item.index)
         vectors = np.asarray([row.embedding for row in rows], dtype=np.float32)
         if vectors.ndim != 2 or vectors.shape[0] != len(texts):
-            raise ValueError("Embedding API returned an unexpected shape.")
+            raise ValueError(f"Embedding API returned shape {vectors.shape}, expected ({len(texts)}, dims).")
         return vectors
 
     return embed
