@@ -16,9 +16,9 @@ from backhead import media as media_mod
 from backhead.agent_loop import Agent, DEFAULT_SYSTEM_PROMPT, messages_to_openai_messages
 from backhead.bootstrap import STATE_DIR
 from backhead.bootstrap import ensure_runtime, open_db_connection, resolve_workspace_host_path
+from backhead.embeddings import create_openai_embed_fn
 from backhead.llm import create_openai_client
 from backhead.private_config import CONFIG, AppConfig
-from backhead.skills import embed as skills_embed
 from backhead.skills import generate_skill_header
 from backhead.tools.cli_tool import create_cli_tool
 from backhead.tools.embed_tool import create_embed_tool
@@ -96,31 +96,18 @@ def build_email_agent_runner(
     max_children: int,
     media_root: Path | None = None,
     workspace_path: Path | None = None,
+    skill_header_provider: Any = None,
 ):
     def run_agent(history: list[dict], current_message: dict) -> str:
         prior = [row for row in history if row["id"] != current_message["id"]]
         prior_messages = messages_to_openai_messages(prior, media_root=media_root)
 
-        augmented_system = system_prompt
-        if workspace_path is not None:
-            message_text = " ".join(
-                part["content"]
-                for part in current_message.get("content", [])
-                if part["content_type"] == "text"
-            ).strip()
-            if message_text:
-                try:
-                    header = generate_skill_header(message_text, workspace_path)
-                except Exception as exc:  # noqa: BLE001
-                    print(f"Skill-header generation failed: {exc}")
-                    header = None
-                if header:
-                    augmented_system = f"{system_prompt}\n\n{header}"
-
         agent = Agent(
             openai_client=openai_client,
             model=model,
-            system_prompt=augmented_system,
+            system_prompt=system_prompt,
+            workspace_path=workspace_path,
+            skill_header_provider=skill_header_provider,
             conversation_history=prior_messages,
             tools=tools,
             tool_handlers=tool_handlers,
@@ -162,9 +149,23 @@ def create_podman_runner(container_name: str, timeout_seconds: int = 300):
 def create_tooling(*, config: AppConfig, container_runner):
     main_client = create_openai_client(config.main_agent.base_url, config.main_agent.api_key)
     sub_client = create_openai_client(config.subagent.base_url, config.subagent.api_key)
+    embedding_client = create_openai_client(config.main_agent.base_url, config.main_agent.api_key)
+    embed_fn = create_openai_embed_fn(embedding_client, config.embedding_model)
 
     cli_schema, cli_handler = create_cli_tool(container_runner)
-    embed_schema, embed_handler = create_embed_tool(skills_embed)
+    embed_schema, embed_handler = create_embed_tool(embed_fn)
+
+    def skill_header_provider(prompt_text: str, workspace_path: Path) -> str | None:
+        try:
+            return generate_skill_header(
+                prompt_text,
+                workspace_path,
+                min_similarity=config.skill_similarity_threshold,
+                embed_fn=embed_fn,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"Skill-header generation failed: {exc}")
+            return None
 
     subagent_tools: list[dict] = [cli_schema, embed_schema]
     subagent_handlers: dict[str, Any] = {"run_cli": cli_handler, "embed_text": embed_handler}
@@ -172,6 +173,8 @@ def create_tooling(*, config: AppConfig, container_runner):
         openai_client=sub_client,
         model=config.subagent.model,
         system_prompt=DEFAULT_SYSTEM_PROMPT,
+        workspace_path=resolve_workspace_host_path(config),
+        skill_header_provider=skill_header_provider,
         tools=subagent_tools,
         tool_handlers=subagent_handlers,
         container_runner=container_runner,
@@ -191,6 +194,7 @@ def create_tooling(*, config: AppConfig, container_runner):
         "main_handlers": main_handlers,
         "sub_tools": subagent_tools,
         "sub_handlers": subagent_handlers,
+        "skill_header_provider": skill_header_provider,
     }
 
 
@@ -306,6 +310,7 @@ async def run_backend(config: AppConfig = CONFIG) -> None:
         max_children=config.maximum_children_per_agent,
         media_root=MEDIA_ROOT,
         workspace_path=resolve_workspace_host_path(config),
+        skill_header_provider=tooling["skill_header_provider"],
     )
 
     while True:

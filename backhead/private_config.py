@@ -134,6 +134,8 @@ class AppConfig:
         maximum_concurrent_conversations: int,
         maximum_agent_depth: int,
         maximum_children_per_agent: int,
+        embedding_model: str,
+        skill_similarity_threshold: float,
         podman_container_name: str,
         workspace_path: str,
         spam_mailbox: str,
@@ -148,6 +150,8 @@ class AppConfig:
         self._maximum_concurrent_conversations = maximum_concurrent_conversations
         self._maximum_agent_depth = maximum_agent_depth
         self._maximum_children_per_agent = maximum_children_per_agent
+        self._embedding_model = embedding_model
+        self._skill_similarity_threshold = skill_similarity_threshold
         self._podman_container_name = podman_container_name
         self._workspace_path = workspace_path
         self._spam_mailbox = spam_mailbox
@@ -191,6 +195,14 @@ class AppConfig:
     @property
     def maximum_children_per_agent(self) -> int:
         return self._maximum_children_per_agent
+
+    @property
+    def embedding_model(self) -> str:
+        return self._embedding_model
+
+    @property
+    def skill_similarity_threshold(self) -> float:
+        return self._skill_similarity_threshold
 
     @property
     def podman_container_name(self) -> str:
@@ -240,6 +252,8 @@ CONFIG = AppConfig(
     maximum_concurrent_conversations=2,
     maximum_agent_depth=2,
     maximum_children_per_agent=4,
+    embedding_model="replace-embedding-model",
+    skill_similarity_threshold=0.35,
     podman_container_name="podhead-agent",
     workspace_path="head_pod",
     spam_mailbox="Junk",

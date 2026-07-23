@@ -1,41 +1,16 @@
-"""Skill-header sidecar generation for the trusted backend.
-
-The backend calls ``generate_skill_header`` before dispatching each incoming
-user message to the main LLM. It returns a compact block of the most relevant
-skill names and descriptions so the agent is oriented before it replies.
-"""
+"""Backend skill sidecar loading, matching, and injection formatting."""
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable
-
-import threading
+from typing import Any, Callable
 
 import numpy as np
 import yaml
 
 SKILL_FILENAME = "SKILL.md"
 EMBED_FILENAME = ".embed.npy"
-_EMBED_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
-_model = None
-_model_lock = threading.Lock()
-
-
-def _get_model():
-    global _model  # noqa: PLW0603
-    if _model is None:
-        with _model_lock:
-            if _model is None:
-                from sentence_transformers import SentenceTransformer  # noqa: PLC0415
-
-                _model = SentenceTransformer(_EMBED_MODEL_NAME)
-    return _model
-
-
-def embed(texts: list[str]) -> np.ndarray:
-    """Return normalized embedding vectors for a list of texts."""
-    return _get_model().encode(texts, normalize_embeddings=True)
+DEFAULT_SKILL_SIMILARITY_THRESHOLD = 0.35
 
 
 def _parse_skill_meta(skill_md: Path) -> dict | None:
@@ -66,54 +41,166 @@ def _find_skills(skills_dir: Path) -> list[dict]:
     return skills
 
 
-def _load_or_create_embedding(skill: dict, embed_fn: Callable) -> np.ndarray:
-    """Load cached embedding or compute and cache a fresh one.
+def _delete_sidecar(embed_path: Path) -> None:
+    try:
+        embed_path.unlink()
+    except FileNotFoundError:
+        pass
 
-    The cache file (.embed.npy) lives beside SKILL.md and is invalidated
-    whenever SKILL.md has a newer mtime.
-    """
+
+def _coerce_embedding_vector(value: Any, *, expected_dimensions: int | None = None) -> np.ndarray:
+    try:
+        vec = np.asarray(value, dtype=np.float32)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Embedding must be a one-dimensional numeric vector.") from exc
+    if vec.ndim != 1:
+        raise ValueError("Embedding must be a one-dimensional vector.")
+    if vec.size == 0:
+        raise ValueError("Embedding must not be empty.")
+    if not np.isfinite(vec).all():
+        raise ValueError("Embedding must contain only finite values.")
+    if expected_dimensions is not None and vec.shape[0] != expected_dimensions:
+        raise ValueError(
+            f"Embedding dimensions are incompatible: expected {expected_dimensions}, got {vec.shape[0]}."
+        )
+    return vec
+
+
+def _normalize_embedding(vec: np.ndarray) -> np.ndarray:
+    norm = float(np.linalg.norm(vec))
+    if not np.isfinite(norm) or norm <= 0.0:
+        raise ValueError("Embedding must have a non-zero length.")
+    return vec / norm
+
+
+def _cosine_similarity(left: np.ndarray, right: np.ndarray) -> float:
+    if left.shape != right.shape:
+        raise ValueError("Embedding dimensions are incompatible.")
+    return float(np.dot(_normalize_embedding(left), _normalize_embedding(right)))
+
+
+def _container_skill_path(skill_md: Path, workspace_path: Path) -> str:
+    return str(Path("/workspace") / skill_md.relative_to(workspace_path))
+
+
+def _load_sidecar_embedding(embed_path: Path, *, expected_dimensions: int | None = None) -> np.ndarray:
+    return _coerce_embedding_vector(np.load(embed_path, allow_pickle=False), expected_dimensions=expected_dimensions)
+
+
+def _create_sidecar_embedding(
+    skill: dict,
+    embed_fn: Callable[[list[str]], np.ndarray],
+    *,
+    expected_dimensions: int | None = None,
+) -> np.ndarray:
+    text = f"{skill['name']}. {skill['description']}"
+    vecs = embed_fn([text])
+    if len(vecs) != 1:
+        raise ValueError("Embedding API returned an unexpected number of vectors.")
+    vec = _coerce_embedding_vector(vecs[0], expected_dimensions=expected_dimensions)
+    np.save(skill["skill_md"].parent / EMBED_FILENAME, vec)
+    return vec
+
+
+def _load_or_create_embedding(
+    skill: dict,
+    embed_fn: Callable[[list[str]], np.ndarray],
+    *,
+    expected_dimensions: int | None = None,
+) -> np.ndarray:
+    """Load cached embedding or compute and cache a fresh one."""
     skill_md: Path = skill["skill_md"]
     embed_path = skill_md.parent / EMBED_FILENAME
     skill_mtime = skill_md.stat().st_mtime
+
     if embed_path.exists() and embed_path.stat().st_mtime >= skill_mtime:
-        return np.load(embed_path)
-    text = f"{skill['name']}. {skill['description']}"
-    vec = embed_fn([text])[0]
-    np.save(embed_path, vec)
-    return vec
+        try:
+            return _load_sidecar_embedding(embed_path, expected_dimensions=expected_dimensions)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Deleting invalid skill sidecar {embed_path}: {exc}")
+            _delete_sidecar(embed_path)
+
+    return _create_sidecar_embedding(skill, embed_fn, expected_dimensions=expected_dimensions)
+
+
+def _result_fields(match_count: int) -> tuple[str, ...]:
+    if match_count <= 20:
+        return ("name", "description", "path")
+    if match_count <= 100:
+        return ("name", "path")
+    return ("name",)
+
+
+def format_skill_matches(matches: list[dict], *, section_title: str | None = None) -> str:
+    """Format the complete ordered result set for agent-visible output."""
+    if not matches:
+        return ""
+
+    fields = _result_fields(len(matches))
+    lines: list[str] = []
+    if section_title:
+        lines.append(section_title)
+
+    for index, match in enumerate(matches):
+        if index and fields != ("name",):
+            lines.append("")
+        for field in fields:
+            lines.append(f"{field}: {match[field]}")
+
+    return "\n".join(lines)
+
+
+def find_skill_matches(
+    query_embedding: np.ndarray,
+    workspace_path: Path,
+    *,
+    min_similarity: float = DEFAULT_SKILL_SIMILARITY_THRESHOLD,
+    embed_fn: Callable[[list[str]], np.ndarray],
+) -> list[dict]:
+    """Return sorted skill matches whose cosine similarity meets the threshold."""
+    skills_dir = workspace_path / "skills"
+    if not skills_dir.is_dir():
+        return []
+
+    query_vec = _coerce_embedding_vector(query_embedding)
+    skills = _find_skills(skills_dir)
+    if not skills:
+        return []
+
+    scored = []
+    for skill in skills:
+        vec = _load_or_create_embedding(skill, embed_fn, expected_dimensions=query_vec.shape[0])
+        score = _cosine_similarity(query_vec, vec)
+        if score >= min_similarity:
+            scored.append(
+                {
+                    **skill,
+                    "path": _container_skill_path(skill["skill_md"], workspace_path),
+                    "score": score,
+                }
+            )
+
+    scored.sort(key=lambda item: item["score"], reverse=True)
+    return scored
 
 
 def generate_skill_header(
     message_text: str,
     workspace_path: Path,
-    top: int = 3,
-    embed_fn: Callable | None = None,
+    *,
+    min_similarity: float = DEFAULT_SKILL_SIMILARITY_THRESHOLD,
+    embed_fn: Callable[[list[str]], np.ndarray],
 ) -> str | None:
-    """Return a skill-header sidecar string, or None if no skills are available.
-
-    Reads SKILL.md files from ``workspace_path/skills/``, ranks them by
-    cosine similarity against ``message_text``, and formats the top matches
-    as a block suitable for injection into the LLM system prompt.
-    """
-    if embed_fn is None:
-        embed_fn = embed
-
-    skills_dir = workspace_path / "skills"
-    if not skills_dir.is_dir():
+    """Return a relevant-skills block, or None when nothing matches."""
+    query_vecs = embed_fn([message_text])
+    if len(query_vecs) != 1:
+        raise ValueError("Embedding API returned an unexpected number of vectors.")
+    matches = find_skill_matches(
+        query_vecs[0],
+        workspace_path,
+        min_similarity=min_similarity,
+        embed_fn=embed_fn,
+    )
+    if not matches:
         return None
-    skills = _find_skills(skills_dir)
-    if not skills:
-        return None
-
-    query_vec = embed_fn([message_text])[0]
-    scored = []
-    for skill in skills:
-        vec = _load_or_create_embedding(skill, embed_fn)
-        scored.append({**skill, "score": float(np.dot(query_vec, vec))})
-    scored.sort(key=lambda x: x["score"], reverse=True)
-    top_skills = scored[:top]
-
-    lines = ["[Skill context — relevant skills from workspace]"]
-    for s in top_skills:
-        lines.append(f"- {s['name']}: {s['description']}")
-    return "\n".join(lines)
+    return format_skill_matches(matches, section_title="[Relevant skills]")

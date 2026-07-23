@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from backhead.agent_loop import Agent, tool_error_result
@@ -34,6 +35,8 @@ def create_spawn_subagent_tool(
     openai_client: Any,
     model: str,
     system_prompt: str,
+    workspace_path: Path | None,
+    skill_header_provider: Any,
     tools: list[dict],
     tool_handlers: dict[str, Any],
     container_runner: Any,
@@ -66,6 +69,8 @@ def create_spawn_subagent_tool(
             openai_client=openai_client,
             model=model,
             system_prompt=system_prompt,
+            workspace_path=workspace_path,
+            skill_header_provider=skill_header_provider,
             tools=tools,
             tool_handlers=tool_handlers,
             container_runner=container_runner,

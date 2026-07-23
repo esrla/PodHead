@@ -15,7 +15,8 @@ HISTORY_SEPARATOR = "\n\n---\n\n"
 DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful AI assistant running inside PodHead. "
     f"At the start of each session read {AGENT_WORKSPACE_GUIDE} for workspace instructions. "
-    "Follow the instructions found there for all tool use and file management."
+    "Follow the instructions found there for all tool use and file management. "
+    "Relevant skills may appear here as headers only; read the referenced /workspace/skills/.../SKILL.md before using one, follow it, do not infer the skill body from the name or description alone, and treat /workspace as your persistent workspace root."
 )
 
 
@@ -77,6 +78,20 @@ def _format_result_preview(result: Any) -> str:
     else:
         text = str(result)
     return _preview(text)
+
+
+def _prompt_text_for_skill_matching(prompt: str | list) -> str:
+    if isinstance(prompt, str):
+        return prompt.strip()
+    if isinstance(prompt, list):
+        text_parts = []
+        for item in prompt:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text = item.get("text")
+                if isinstance(text, str):
+                    text_parts.append(text)
+        return "".join(text_parts).strip()
+    return ""
 
 
 def _build_tree_lines(
@@ -194,6 +209,8 @@ class Agent:
         openai_client: Any,
         model: str,
         system_prompt: str,
+        workspace_path: Path | None = None,
+        skill_header_provider: Any = None,
         conversation_history: list[dict] | None = None,
         tools: list[dict] | None = None,
         tool_handlers: dict[str, Any] | None = None,
@@ -205,6 +222,8 @@ class Agent:
         self.openai_client = openai_client
         self.model = model
         self.system_prompt = system_prompt
+        self.workspace_path = workspace_path
+        self.skill_header_provider = skill_header_provider
         self.conversation_history: list[dict] = list(conversation_history or [])
         self.tools: list[dict] = list(tools or [])
         self.tool_handlers: dict[str, Any] = dict(tool_handlers or {})
@@ -216,6 +235,20 @@ class Agent:
         self._final_reply: str = ""
         self._children_spawned = 0
         self._pending_child_agent: "Agent | None" = None
+        self._skills_injected = False
+
+    def _inject_relevant_skills_once(self, prompt: str | list) -> None:
+        if self._skills_injected:
+            return
+        self._skills_injected = True
+        if self.workspace_path is None or self.skill_header_provider is None:
+            return
+        prompt_text = _prompt_text_for_skill_matching(prompt)
+        if not prompt_text:
+            return
+        header = self.skill_header_provider(prompt_text, self.workspace_path)
+        if header:
+            self.system_prompt = f"{self.system_prompt}\n\n{header}"
 
     def _append_tool_result(self, tool_call_id: str, result: Any) -> None:
         if isinstance(result, (dict, list)):
@@ -234,6 +267,7 @@ class Agent:
 
     def run(self, prompt: str | list) -> str:
         """Append *prompt* as a user message and run the agent loop to completion."""
+        self._inject_relevant_skills_once(prompt)
         self.conversation_history.append({"role": "user", "content": prompt})
         return self._run_loop()
 
