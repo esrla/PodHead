@@ -2,7 +2,7 @@
 
 PodHead is an email-driven agent backend with a strict split between backend code and an isolated Podman workspace.
 
-llama.cpp, through its OpenAI-compatible embeddings endpoint, is the only production embedding provider.
+llama.cpp, through a dedicated OpenAI-compatible embedding endpoint, is the only production embedding provider.
 
 ## Backend entrypoint
 
@@ -12,7 +12,7 @@ PodHead has one user-facing startup command:
 python -m backhead.main
 ```
 
-Backend startup bootstraps the runtime automatically before entering the normal mail loop.
+Backend startup bootstraps the runtime automatically before entering the normal mail loop, including health-checking and starting the configured local chat and embedding llama-server processes when needed.
 
 ## Configuration
 
@@ -23,7 +23,8 @@ The configuration defines:
 
 - main-agent endpoint and model
 - subagent endpoint and model
-- llama.cpp-compatible embedding model
+- dedicated embedding endpoint and model
+- managed local model-server settings for chat and embeddings
 - skill similarity threshold
 - one PodHead email account
 - IMAP settings
@@ -44,11 +45,12 @@ Persisted email history is loaded from SQLite for the main agent, while subagent
 
 ## Email processing
 
-- IMAP polling stores incoming whitelisted messages in SQLite with persistent processing states.
+- IMAP polling stores incoming whitelisted messages in SQLite.
 - Different conversations can run concurrently.
 - One conversation is always processed sequentially in FIFO order.
-- Failed incoming messages stay in SQLite and are retried by the backend loop.
-- Conversation history is loaded in deterministic `timestamp, id` order.
+- Message history remains append-only in SQLite.
+- Dedicated per-message embeddings and conversation compaction summaries are stored as backend side data only.
+- Conversation history is loaded in deterministic `id` order.
 - Consecutive user or assistant messages are collapsed before sending history to the model.
 
 ## Tool execution
@@ -56,7 +58,8 @@ Persisted email history is loaded from SQLite for the main agent, while subagent
 - `spawn_subagent` accepts only `{"prompt": "..."}` from the model.
 - The backend chooses each agent's OpenAI-compatible client, model, system prompt, and tools.
 - Tool failures are returned to the agent as structured tool-result messages.
-- `embed_text` and skill matching use the configured llama.cpp/OpenAI-compatible embeddings endpoint and embedding model.
+- `embed_text`, skill matching, and chat-history indexing/search use the dedicated backend embedding endpoint.
+- `search_chat_history` runs entirely in the trusted backend and searches previous conversations for the same sender.
 - `run_cli` executes commands only through the configured Podman container.
 
 ## Container boundary

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import time
 from pathlib import Path
 
@@ -160,7 +159,7 @@ class TestLoadOrCreateEmbedding:
 
 class TestFindSkillMatches:
     def test_missing_skills_dir_returns_empty(self, tmp_path):
-        matches = find_skill_matches(_unit_vec(0), tmp_path, embed_fn=_make_embed({}))
+        matches = find_skill_matches(_unit_vec(0), tmp_path, document_embed_fn=_make_embed({}))
         assert matches == []
 
     def test_below_threshold_skills_are_excluded(self, tmp_path):
@@ -169,7 +168,7 @@ class TestFindSkillMatches:
             _unit_vec(0),
             tmp_path,
             min_similarity=0.5,
-            embed_fn=_make_embed({"calculator": 1, "arithmetic": 1}),
+            document_embed_fn=_make_embed({"calculator": 1, "arithmetic": 1}),
         )
         assert matches == []
 
@@ -180,7 +179,7 @@ class TestFindSkillMatches:
             _unit_vec(0),
             tmp_path,
             min_similarity=0.0,
-            embed_fn=_make_embed({"calculator": 0, "arithmetic": 0, "weather": 1, "forecast": 1}),
+            document_embed_fn=_make_embed({"calculator": 0, "arithmetic": 0, "weather": 1, "forecast": 1}),
         )
         assert [match["name"] for match in matches][:2] == ["Calculator", "Weather"]
         assert all(match["path"].startswith("/workspace/") for match in matches)
@@ -198,7 +197,13 @@ class TestFindSkillMatches:
             seen_texts.extend(texts)
             return np.array([_unit_vec(0)] * len(texts), dtype=np.float32)
 
-        header = generate_skill_header("arithmetic", tmp_path, min_similarity=0.0, embed_fn=embed_fn)
+        header = generate_skill_header(
+            "arithmetic",
+            tmp_path,
+            min_similarity=0.0,
+            query_embed_fn=embed_fn,
+            document_embed_fn=embed_fn,
+        )
         assert seen_texts == ["arithmetic", "Calculator. Does arithmetic."]
         assert "Do not inject me." not in header
 
@@ -208,7 +213,8 @@ class TestFindSkillMatches:
             "weather",
             tmp_path,
             min_similarity=0.1,
-            embed_fn=_make_embed({"weather": 0, "calculator": 1, "arithmetic": 1}),
+            query_embed_fn=_make_embed({"weather": 0, "calculator": 1, "arithmetic": 1}),
+            document_embed_fn=_make_embed({"weather": 0, "calculator": 1, "arithmetic": 1}),
         )
         assert header is None
 
@@ -218,7 +224,8 @@ class TestFindSkillMatches:
             "arithmetic",
             tmp_path,
             min_similarity=0.0,
-            embed_fn=_make_embed({"arithmetic": 0, "calculator": 0}),
+            query_embed_fn=_make_embed({"arithmetic": 0, "calculator": 0}),
+            document_embed_fn=_make_embed({"arithmetic": 0, "calculator": 0}),
         )
         assert header is not None
         assert header.startswith("[Relevant skills]")

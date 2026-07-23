@@ -89,12 +89,12 @@ def _load_sidecar_embedding(embed_path: Path, *, expected_dimensions: int | None
 
 def _create_sidecar_embedding(
     skill: dict,
-    embed_fn: Callable[[list[str]], np.ndarray],
+    document_embed_fn: Callable[[list[str]], np.ndarray],
     *,
     expected_dimensions: int | None = None,
 ) -> np.ndarray:
     text = f"{skill['name']}. {skill['description']}"
-    vecs = embed_fn([text])
+    vecs = document_embed_fn([text])
     if len(vecs) != 1:
         raise ValueError("Embedding API returned an unexpected number of vectors.")
     vec = _coerce_embedding_vector(vecs[0], expected_dimensions=expected_dimensions)
@@ -104,7 +104,7 @@ def _create_sidecar_embedding(
 
 def _load_or_create_embedding(
     skill: dict,
-    embed_fn: Callable[[list[str]], np.ndarray],
+    document_embed_fn: Callable[[list[str]], np.ndarray],
     *,
     expected_dimensions: int | None = None,
 ) -> np.ndarray:
@@ -120,7 +120,7 @@ def _load_or_create_embedding(
             print(f"Deleting invalid skill sidecar {embed_path}: {exc}")
             _delete_sidecar(embed_path)
 
-    return _create_sidecar_embedding(skill, embed_fn, expected_dimensions=expected_dimensions)
+    return _create_sidecar_embedding(skill, document_embed_fn, expected_dimensions=expected_dimensions)
 
 
 def _result_fields(match_count: int) -> tuple[str, ...]:
@@ -155,7 +155,7 @@ def find_skill_matches(
     workspace_path: Path,
     *,
     min_similarity: float = DEFAULT_SKILL_SIMILARITY_THRESHOLD,
-    embed_fn: Callable[[list[str]], np.ndarray],
+    document_embed_fn: Callable[[list[str]], np.ndarray],
 ) -> list[dict]:
     """Return sorted skill matches whose cosine similarity meets the threshold."""
     skills_dir = workspace_path / "skills"
@@ -169,7 +169,7 @@ def find_skill_matches(
 
     scored = []
     for skill in skills:
-        vec = _load_or_create_embedding(skill, embed_fn, expected_dimensions=query_vec.shape[0])
+        vec = _load_or_create_embedding(skill, document_embed_fn, expected_dimensions=query_vec.shape[0])
         score = _cosine_similarity(query_vec, vec)
         if score >= min_similarity:
             scored.append(
@@ -189,17 +189,18 @@ def generate_skill_header(
     workspace_path: Path,
     *,
     min_similarity: float = DEFAULT_SKILL_SIMILARITY_THRESHOLD,
-    embed_fn: Callable[[list[str]], np.ndarray],
+    query_embed_fn: Callable[[list[str]], np.ndarray],
+    document_embed_fn: Callable[[list[str]], np.ndarray],
 ) -> str | None:
     """Return a relevant-skills block, or None when nothing matches."""
-    query_vecs = embed_fn([message_text])
+    query_vecs = query_embed_fn([message_text])
     if len(query_vecs) != 1:
         raise ValueError("Embedding API returned an unexpected number of vectors.")
     matches = find_skill_matches(
         query_vecs[0],
         workspace_path,
         min_similarity=min_similarity,
-        embed_fn=embed_fn,
+        document_embed_fn=document_embed_fn,
     )
     if not matches:
         return None

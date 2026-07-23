@@ -7,9 +7,12 @@ import json
 from pathlib import Path
 import sqlite3
 import subprocess
+import time
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 from backhead import db
-from backhead.private_config import CONFIG, AppConfig
+from backhead.private_config import CONFIG, AppConfig, AgentEndpointConfig
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 STATE_DIR = REPO_ROOT / "state"
@@ -23,6 +26,9 @@ IMAGE_BUILD_INPUTS = (
     CONTAINERFILE_PATH,
     REPO_ROOT / "container-requirements.txt",
 )
+STARTED_MODEL_SERVER_PROCESSES: list[subprocess.Popen] = []
+MODEL_SERVER_STARTUP_TIMEOUT_SECONDS = 15.0
+MODEL_SERVER_STARTUP_POLL_INTERVAL_SECONDS = 0.25
 
 
 class PodmanVerificationError(RuntimeError):
@@ -46,7 +52,8 @@ def validate_config(config: AppConfig) -> None:
         config.main_agent.model,
         config.subagent.api_key,
         config.subagent.model,
-        config.embedding_model,
+        config.embedding_endpoint.api_key,
+        config.embedding_endpoint.model,
         config.email_account.password,
         config.imap.password,
         config.smtp.password,
@@ -57,8 +64,8 @@ def validate_config(config: AppConfig) -> None:
         raise ValueError("workspace_path must not be empty.")
     if not config.spam_mailbox.strip():
         raise ValueError("spam_mailbox must not be empty.")
-    if not config.embedding_model.strip():
-        raise ValueError("embedding_model must not be empty.")
+    if not config.embedding_endpoint.base_url.strip():
+        raise ValueError("embedding_endpoint.base_url must not be empty.")
     if not 0.0 <= config.skill_similarity_threshold <= 1.0:
         raise ValueError(
             f"skill_similarity_threshold must be between 0.0 and 1.0, got {config.skill_similarity_threshold}."
@@ -227,6 +234,102 @@ def _start_container(name: str) -> None:
     subprocess.run(["podman", "start", name], check=True)
 
 
+def _endpoint_health_url(endpoint: AgentEndpointConfig) -> str:
+    return f"{endpoint.base_url.rstrip('/')}/models"
+
+
+def _is_endpoint_healthy(endpoint: AgentEndpointConfig) -> bool:
+    try:
+        with urllib_request.urlopen(_endpoint_health_url(endpoint), timeout=2.0) as response:
+            return 200 <= getattr(response, "code", 0) < 300
+    except (urllib_error.URLError, TimeoutError, ValueError):
+        return False
+
+
+def _expanded_path(path_value: str, *, label: str) -> Path:
+    path = Path(path_value).expanduser()
+    if not path.exists():
+        raise RuntimeError(f"{label} not found: {path}")
+    return path
+
+
+def _validate_managed_endpoint(endpoint: AgentEndpointConfig, *, label: str) -> tuple[Path, Path]:
+    required_fields = {
+        "executable_path": endpoint.executable_path,
+        "model_path": endpoint.model_path,
+        "host": endpoint.host,
+        "port": endpoint.port,
+        "context_size": endpoint.context_size,
+        "threads": endpoint.threads,
+    }
+    missing = [name for name, value in required_fields.items() if value in (None, "")]
+    if missing:
+        raise RuntimeError(f"{label} is missing managed server configuration: {', '.join(missing)}")
+    executable = _expanded_path(str(endpoint.executable_path), label=f"{label} llama-server executable")
+    if not executable.is_file():
+        raise RuntimeError(f"{label} llama-server executable not found: {executable}")
+    model_path = _expanded_path(str(endpoint.model_path), label=f"{label} model file")
+    if not model_path.is_file():
+        raise RuntimeError(f"{label} model file not found: {model_path}")
+    return executable, model_path
+
+
+def _build_model_server_command(endpoint: AgentEndpointConfig, *, label: str) -> list[str]:
+    executable, model_path = _validate_managed_endpoint(endpoint, label=label)
+    command = [
+        str(executable),
+        "--model",
+        str(model_path),
+        "--ctx-size",
+        str(endpoint.context_size),
+        "--threads",
+        str(endpoint.threads),
+    ]
+    if endpoint.embeddings:
+        command.append("--embeddings")
+    command.extend([
+        "--host",
+        str(endpoint.host),
+        "--port",
+        str(endpoint.port),
+    ])
+    return command
+
+
+def _start_model_server(endpoint: AgentEndpointConfig, *, label: str) -> None:
+    command = _build_model_server_command(endpoint, label=label)
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    STARTED_MODEL_SERVER_PROCESSES.append(process)
+
+
+def _wait_for_endpoint(endpoint: AgentEndpointConfig, *, label: str) -> None:
+    deadline = time.monotonic() + MODEL_SERVER_STARTUP_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if _is_endpoint_healthy(endpoint):
+            return
+        time.sleep(MODEL_SERVER_STARTUP_POLL_INTERVAL_SECONDS)
+    raise RuntimeError(f"{label} did not become healthy at {_endpoint_health_url(endpoint)} after startup.")
+
+
+def ensure_model_servers(config: AppConfig) -> None:
+    managed_endpoints = (
+        ("Main model server", config.main_agent),
+        ("Embedding model server", config.embedding_endpoint),
+    )
+    for label, endpoint in managed_endpoints:
+        if not endpoint.manages_local_process:
+            continue
+        if _is_endpoint_healthy(endpoint):
+            continue
+        _start_model_server(endpoint, label=label)
+        _wait_for_endpoint(endpoint, label=label)
+
+
 def verify_container_environment(config: AppConfig, *, expected_image_id: str | None = None) -> None:
     workspace_host_path = resolve_workspace_host_path(config)
     inspect = _inspect_container(config.podman_container_name)
@@ -261,6 +364,7 @@ def ensure_runtime(config: AppConfig = CONFIG) -> None:
     validate_config(config)
     ensure_podman_available()
     ensure_state_dir()
+    ensure_model_servers(config)
     workspace_host_path = resolve_workspace_host_path(config)
     workspace_host_path.mkdir(parents=True, exist_ok=True)
     image_id, _ = ensure_container_image()

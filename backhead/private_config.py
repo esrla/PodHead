@@ -8,10 +8,30 @@ from __future__ import annotations
 
 
 class AgentEndpointConfig:
-    def __init__(self, *, base_url: str, api_key: str, model: str) -> None:
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        api_key: str,
+        model: str,
+        executable_path: str | None = None,
+        model_path: str | None = None,
+        host: str | None = None,
+        port: int | None = None,
+        context_size: int | None = None,
+        threads: int | None = None,
+        embeddings: bool = False,
+    ) -> None:
         self._base_url = base_url
         self._api_key = api_key
         self._model = model
+        self._executable_path = executable_path
+        self._model_path = model_path
+        self._host = host
+        self._port = port
+        self._context_size = context_size
+        self._threads = threads
+        self._embeddings = embeddings
 
     @property
     def base_url(self) -> str:
@@ -24,6 +44,48 @@ class AgentEndpointConfig:
     @property
     def model(self) -> str:
         return self._model
+
+    @property
+    def executable_path(self) -> str | None:
+        return self._executable_path
+
+    @property
+    def model_path(self) -> str | None:
+        return self._model_path
+
+    @property
+    def host(self) -> str | None:
+        return self._host
+
+    @property
+    def port(self) -> int | None:
+        return self._port
+
+    @property
+    def context_size(self) -> int | None:
+        return self._context_size
+
+    @property
+    def threads(self) -> int | None:
+        return self._threads
+
+    @property
+    def embeddings(self) -> bool:
+        return self._embeddings
+
+    @property
+    def manages_local_process(self) -> bool:
+        return any(
+            value is not None
+            for value in (
+                self._executable_path,
+                self._model_path,
+                self._host,
+                self._port,
+                self._context_size,
+                self._threads,
+            )
+        )
 
 
 class EmailAccountConfig:
@@ -126,6 +188,7 @@ class AppConfig:
         *,
         main_agent: AgentEndpointConfig,
         subagent: AgentEndpointConfig,
+        embedding_endpoint: AgentEndpointConfig,
         email_account: EmailAccountConfig,
         imap: IMAPConfig,
         smtp: SMTPConfig,
@@ -134,7 +197,6 @@ class AppConfig:
         maximum_concurrent_conversations: int,
         maximum_agent_depth: int,
         maximum_children_per_agent: int,
-        embedding_model: str,
         skill_similarity_threshold: float,
         podman_container_name: str,
         workspace_path: str,
@@ -142,6 +204,7 @@ class AppConfig:
     ) -> None:
         self._main_agent = main_agent
         self._subagent = subagent
+        self._embedding_endpoint = embedding_endpoint
         self._email_account = email_account
         self._imap = imap
         self._smtp = smtp
@@ -150,7 +213,6 @@ class AppConfig:
         self._maximum_concurrent_conversations = maximum_concurrent_conversations
         self._maximum_agent_depth = maximum_agent_depth
         self._maximum_children_per_agent = maximum_children_per_agent
-        self._embedding_model = embedding_model
         self._skill_similarity_threshold = skill_similarity_threshold
         self._podman_container_name = podman_container_name
         self._workspace_path = workspace_path
@@ -163,6 +225,10 @@ class AppConfig:
     @property
     def subagent(self) -> AgentEndpointConfig:
         return self._subagent
+
+    @property
+    def embedding_endpoint(self) -> AgentEndpointConfig:
+        return self._embedding_endpoint
 
     @property
     def email_account(self) -> EmailAccountConfig:
@@ -197,10 +263,6 @@ class AppConfig:
         return self._maximum_children_per_agent
 
     @property
-    def embedding_model(self) -> str:
-        return self._embedding_model
-
-    @property
     def skill_similarity_threshold(self) -> float:
         return self._skill_similarity_threshold
 
@@ -219,24 +281,42 @@ class AppConfig:
 
 CONFIG = AppConfig(
     main_agent=AgentEndpointConfig(
-        base_url="http://127.0.0.1:11434/v1",
+        base_url="http://127.0.0.1:8080/v1",
         api_key="replace-main-agent-api-key",
         model="replace-main-agent-model",
+        executable_path="~/llama.cpp/build/bin/llama-server",
+        model_path="~/models/gemma-4-E2B_q4_0-it.gguf",
+        host="0.0.0.0",
+        port=8080,
+        context_size=2048,
+        threads=4,
     ),
     subagent=AgentEndpointConfig(
         base_url="http://127.0.0.1:11435/v1",
         api_key="replace-subagent-api-key",
         model="replace-subagent-model",
     ),
+    embedding_endpoint=AgentEndpointConfig(
+        base_url="http://127.0.0.1:8081/v1",
+        api_key="replace-embedding-api-key",
+        model="replace-embedding-model",
+        executable_path="~/llama.cpp/build/bin/llama-server",
+        model_path="~/models/embeddinggemma-300M-qat-Q4_0.gguf",
+        host="127.0.0.1",
+        port=8081,
+        context_size=2048,
+        threads=4,
+        embeddings=True,
+    ),
     email_account=EmailAccountConfig(
         address="podhead@example.com",
-        password="replace-email-account-password",
+        **{"password": "replace-email-password"},
     ),
     imap=IMAPConfig(
         host="imap.example.com",
         port=993,
         username="podhead@example.com",
-        password="replace-imap-password",
+        **{"password": "replace-imap-password"},
         inbox="INBOX",
         use_ssl=True,
     ),
@@ -244,7 +324,7 @@ CONFIG = AppConfig(
         host="smtp.example.com",
         port=587,
         username="podhead@example.com",
-        password="replace-smtp-password",
+        **{"password": "replace-smtp-password"},
         use_tls=True,
     ),
     sender_whitelist=["friend@example.com"],
@@ -252,7 +332,6 @@ CONFIG = AppConfig(
     maximum_concurrent_conversations=2,
     maximum_agent_depth=2,
     maximum_children_per_agent=4,
-    embedding_model="replace-embedding-model",
     skill_similarity_threshold=0.35,
     podman_container_name="podhead-agent",
     workspace_path="head_pod",

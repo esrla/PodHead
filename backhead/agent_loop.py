@@ -218,6 +218,7 @@ class Agent:
         depth: int = 0,
         max_depth: int = 2,
         max_children: int = 4,
+        backend_context: dict[str, Any] | None = None,
     ) -> None:
         self.openai_client = openai_client
         self.model = model
@@ -231,6 +232,7 @@ class Agent:
         self.depth = depth
         self.max_depth = max_depth
         self.max_children = max_children
+        self.backend_context: dict[str, Any] = dict(backend_context or {})
         self._tool_records: list[ToolRecord] = []
         self._final_reply: str = ""
         self._children_spawned = 0

@@ -2,7 +2,7 @@ import sqlite3
 
 import pytest
 
-from backhead import db
+from backhead import chat_history, db
 
 
 def _conn():
@@ -75,3 +75,88 @@ def test_convert_to_local_iso_none_returns_now():
     assert db.convert_to_local_iso(None)
     iso = db.convert_to_local_iso(0)
     assert "T" in iso
+
+
+def test_find_oldest_message_needing_embedding_and_store_replacement():
+    conn = _conn()
+    message_id = db.insert_message_with_content(
+        conn,
+        channel="email",
+        thread_id="thread-1",
+        sender_id="alice@example.com",
+        role="user",
+        timestamp="2026-01-01T00:00:00+00:00",
+        content_parts=[("text", "hello")],
+    )
+
+    candidate = db.find_oldest_message_needing_embedding(
+        conn,
+        sender_id="alice@example.com",
+        embedding_model="embed-model",
+        searchable_text_builder=chat_history.build_searchable_message_text,
+        content_hash_builder=chat_history.build_message_content_hash,
+    )
+    assert candidate is not None
+    assert candidate["id"] == message_id
+
+    db.store_or_replace_message_embedding(
+        conn,
+        message_id=message_id,
+        embedding_model="embed-model",
+        content_hash=candidate["content_hash"],
+        searchable_text=candidate["searchable_text"],
+        embedding=chat_history.vector_to_blob([1.0, 0.0]),
+        embedded_at="2026-01-01T00:00:01+00:00",
+    )
+
+    assert (
+        db.find_oldest_message_needing_embedding(
+            conn,
+            sender_id="alice@example.com",
+            embedding_model="embed-model",
+            searchable_text_builder=chat_history.build_searchable_message_text,
+            content_hash_builder=chat_history.build_message_content_hash,
+        )
+        is None
+    )
+
+
+def test_get_message_embeddings_for_sender_filters_thread():
+    conn = _conn()
+    first = db.insert_message_with_content(
+        conn,
+        channel="email",
+        thread_id="thread-1",
+        sender_id="alice@example.com",
+        role="user",
+        timestamp="2026-01-01T00:00:00+00:00",
+        content_parts=[("text", "hello")],
+    )
+    second = db.insert_message_with_content(
+        conn,
+        channel="email",
+        thread_id="thread-2",
+        sender_id="alice@example.com",
+        role="assistant",
+        timestamp="2026-01-01T00:00:01+00:00",
+        content_parts=[("text", "world")],
+    )
+    for message_id, text in ((first, "hello"), (second, "world")):
+        message = db.get_conversation(conn, "email", f"thread-{1 if message_id == first else 2}")[0]
+        searchable = chat_history.build_searchable_message_text(message)
+        db.store_or_replace_message_embedding(
+            conn,
+            message_id=message_id,
+            embedding_model="embed-model",
+            content_hash=chat_history.build_message_content_hash(message, searchable, "embed-model"),
+            searchable_text=searchable,
+            embedding=chat_history.vector_to_blob([1.0, 0.0]),
+            embedded_at="2026-01-01T00:00:01+00:00",
+        )
+
+    rows = db.get_message_embeddings_for_sender(
+        conn,
+        sender_id="alice@example.com",
+        exclude_thread_id="thread-1",
+    )
+    assert [row["message_id"] for row in rows] == [second]

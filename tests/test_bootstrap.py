@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 
 from backhead import bootstrap
 from backhead import main as main_module
@@ -13,13 +14,36 @@ from backhead.private_config import (
 )
 
 
-def _config(*, workspace_path: str = "head_pod") -> AppConfig:
+def _config(*, workspace_path: str = "head_pod", process_root: Path | None = None) -> AppConfig:
+    process_root = process_root or Path("/tmp/podhead-tests")
     mail_password = "mail-password"
     imap_password = "imap-password"
     smtp_password = "smtp-password"
     return AppConfig(
-        main_agent=AgentEndpointConfig(base_url="http://main", api_key="main-key", model="main-model"),
+        main_agent=AgentEndpointConfig(
+            base_url="http://127.0.0.1:8080/v1",
+            api_key="main-key",
+            model="main-model",
+            executable_path=str(process_root / "llama-server"),
+            model_path=str(process_root / "main.gguf"),
+            host="0.0.0.0",
+            port=8080,
+            context_size=2048,
+            threads=4,
+        ),
         subagent=AgentEndpointConfig(base_url="http://sub", api_key="sub-key", model="sub-model"),
+        embedding_endpoint=AgentEndpointConfig(
+            base_url="http://127.0.0.1:8081/v1",
+            api_key="embed-key",
+            model="embed-model",
+            executable_path=str(process_root / "llama-server"),
+            model_path=str(process_root / "embed.gguf"),
+            host="127.0.0.1",
+            port=8081,
+            context_size=2048,
+            threads=4,
+            embeddings=True,
+        ),
         email_account=EmailAccountConfig(address="podhead@example.com", **{"password": mail_password}),
         imap=IMAPConfig(
             host="imap.example.com",
@@ -41,7 +65,6 @@ def _config(*, workspace_path: str = "head_pod") -> AppConfig:
         maximum_concurrent_conversations=2,
         maximum_agent_depth=2,
         maximum_children_per_agent=4,
-        embedding_model="embed-model",
         skill_similarity_threshold=0.35,
         podman_container_name="podhead-agent",
         workspace_path=workspace_path,
@@ -55,6 +78,11 @@ def _container_inspect(*, running: bool, image_id: str = "image-1", mount_source
         "State": {"Running": running},
         "Mounts": [{"Destination": "/workspace", "Source": str(mount_source)}],
     }
+
+
+def _touch(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("x")
 
 
 def test_main_bootstraps_before_running_backend(monkeypatch):
@@ -121,6 +149,7 @@ def test_ensure_runtime_leaves_valid_running_container_unchanged(monkeypatch, tm
 
     monkeypatch.setattr(bootstrap, "ensure_podman_available", lambda: calls.append("podman"))
     monkeypatch.setattr(bootstrap, "ensure_state_dir", lambda: calls.append("state"))
+    monkeypatch.setattr(bootstrap, "ensure_model_servers", lambda cfg: calls.append("models"))
     monkeypatch.setattr(bootstrap, "ensure_container_image", lambda: ("image-1", False))
     monkeypatch.setattr(bootstrap, "_podman_exists", lambda kind, name: kind == "container")
     monkeypatch.setattr(
@@ -137,7 +166,7 @@ def test_ensure_runtime_leaves_valid_running_container_unchanged(monkeypatch, tm
     bootstrap.ensure_runtime(config)
 
     assert expected_workspace.exists()
-    assert calls == ["podman", "state", "verify", "db"]
+    assert calls == ["podman", "state", "models", "verify", "db"]
 
 
 def test_ensure_runtime_recreates_container_when_workspace_mount_is_wrong(monkeypatch, tmp_path):
@@ -146,6 +175,7 @@ def test_ensure_runtime_recreates_container_when_workspace_mount_is_wrong(monkey
 
     monkeypatch.setattr(bootstrap, "ensure_podman_available", lambda: None)
     monkeypatch.setattr(bootstrap, "ensure_state_dir", lambda: None)
+    monkeypatch.setattr(bootstrap, "ensure_model_servers", lambda cfg: None)
     monkeypatch.setattr(bootstrap, "ensure_container_image", lambda: ("image-1", False))
     monkeypatch.setattr(bootstrap, "_podman_exists", lambda kind, name: kind == "container")
     monkeypatch.setattr(
@@ -193,3 +223,96 @@ def test_ensure_podman_available_explains_installation(monkeypatch):
         assert "python -m backhead.main" in str(exc)
     else:
         raise AssertionError("expected a runtime error when podman is unavailable")
+
+
+def test_ensure_model_servers_skips_start_when_both_endpoints_are_healthy(monkeypatch, tmp_path):
+    config = _config(process_root=tmp_path)
+    monkeypatch.setattr(bootstrap, "_is_endpoint_healthy", lambda endpoint: True)
+    monkeypatch.setattr(
+        bootstrap,
+        "_start_model_server",
+        lambda endpoint, label: (_ for _ in ()).throw(AssertionError("should not start healthy endpoint")),
+    )
+
+    bootstrap.ensure_model_servers(config)
+
+
+def test_ensure_model_servers_starts_only_missing_endpoint(monkeypatch, tmp_path):
+    config = _config(process_root=tmp_path)
+    started = []
+    waited = []
+
+    def fake_health(endpoint):
+        return endpoint.port == 8080
+
+    monkeypatch.setattr(bootstrap, "_is_endpoint_healthy", fake_health)
+    monkeypatch.setattr(bootstrap, "_start_model_server", lambda endpoint, label: started.append((label, endpoint.port)))
+    monkeypatch.setattr(bootstrap, "_wait_for_endpoint", lambda endpoint, label: waited.append((label, endpoint.port)))
+
+    bootstrap.ensure_model_servers(config)
+
+    assert started == [("Embedding model server", 8081)]
+    assert waited == [("Embedding model server", 8081)]
+
+
+def test_ensure_model_servers_starts_both_missing_endpoints(monkeypatch, tmp_path):
+    config = _config(process_root=tmp_path)
+    started = []
+    monkeypatch.setattr(bootstrap, "_is_endpoint_healthy", lambda endpoint: False)
+    monkeypatch.setattr(bootstrap, "_start_model_server", lambda endpoint, label: started.append((label, endpoint.port)))
+    monkeypatch.setattr(bootstrap, "_wait_for_endpoint", lambda endpoint, label: None)
+
+    bootstrap.ensure_model_servers(config)
+
+    assert started == [("Main model server", 8080), ("Embedding model server", 8081)]
+
+
+def test_ensure_model_servers_fails_when_binary_is_missing(monkeypatch, tmp_path):
+    config = _config(process_root=tmp_path)
+    _touch(tmp_path / "main.gguf")
+    _touch(tmp_path / "embed.gguf")
+    monkeypatch.setattr(bootstrap, "_is_endpoint_healthy", lambda endpoint: False)
+    monkeypatch.setattr(bootstrap, "_wait_for_endpoint", lambda endpoint, label: None)
+
+    try:
+        bootstrap.ensure_model_servers(config)
+    except RuntimeError as exc:
+        assert "llama-server executable" in str(exc)
+    else:
+        raise AssertionError("expected missing binary failure")
+
+
+def test_ensure_model_servers_fails_when_model_file_is_missing(monkeypatch, tmp_path):
+    config = _config(process_root=tmp_path)
+    _touch(tmp_path / "llama-server")
+    monkeypatch.setattr(bootstrap, "_is_endpoint_healthy", lambda endpoint: False)
+    monkeypatch.setattr(bootstrap, "_wait_for_endpoint", lambda endpoint, label: None)
+
+    try:
+        bootstrap.ensure_model_servers(config)
+    except RuntimeError as exc:
+        assert "model file" in str(exc)
+    else:
+        raise AssertionError("expected missing model failure")
+
+
+def test_ensure_model_servers_does_not_start_duplicates(monkeypatch, tmp_path):
+    config = _config(process_root=tmp_path)
+    started: set[int] = set()
+    calls: list[int] = []
+
+    def fake_health(endpoint):
+        return endpoint.port in started
+
+    def fake_start(endpoint, label):
+        calls.append(endpoint.port)
+        started.add(endpoint.port)
+
+    monkeypatch.setattr(bootstrap, "_is_endpoint_healthy", fake_health)
+    monkeypatch.setattr(bootstrap, "_start_model_server", fake_start)
+    monkeypatch.setattr(bootstrap, "_wait_for_endpoint", lambda endpoint, label: None)
+
+    bootstrap.ensure_model_servers(config)
+    bootstrap.ensure_model_servers(config)
+
+    assert calls == [8080, 8081]

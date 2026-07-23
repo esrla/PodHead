@@ -26,13 +26,19 @@ def _embedding_response(vector):
 
 
 def _make_message(text: str, msg_id: int = 1) -> dict:
-    return {"id": msg_id, "content": [{"content_type": "text", "content": text}]}
+    return {
+        "id": msg_id,
+        "thread_id": "thread-1",
+        "sender_id": "alice@example.com",
+        "content": [{"content_type": "text", "content": text}],
+    }
 
 
 def _config() -> AppConfig:
     return AppConfig(
         main_agent=AgentEndpointConfig(base_url="http://main", api_key="main-key", model="main-model"),
         subagent=AgentEndpointConfig(base_url="http://sub", api_key="sub-key", model="sub-model"),
+        embedding_endpoint=AgentEndpointConfig(base_url="http://embed", api_key="embed-key", model="embed-model"),
         email_account=EmailAccountConfig(address="podhead@example.com", **{"password": "mail-password"}),
         imap=IMAPConfig(
             host="imap.example.com",
@@ -54,7 +60,6 @@ def _config() -> AppConfig:
         maximum_concurrent_conversations=1,
         maximum_agent_depth=2,
         maximum_children_per_agent=4,
-        embedding_model="embed-model",
         skill_similarity_threshold=0.35,
         podman_container_name="test-container",
         workspace_path="head_pod",
@@ -62,7 +67,7 @@ def _config() -> AppConfig:
     )
 
 
-def test_build_email_agent_runner_passes_workspace_and_skill_provider_to_agent(monkeypatch, tmp_path):
+def test_build_email_agent_runner_passes_workspace_skill_provider_and_backend_context_to_agent(monkeypatch, tmp_path):
     captured = {}
     original_agent = main_module.Agent
 
@@ -70,6 +75,7 @@ def test_build_email_agent_runner_passes_workspace_and_skill_provider_to_agent(m
         captured["system_prompt"] = kwargs["system_prompt"]
         captured["workspace_path"] = kwargs.get("workspace_path")
         captured["skill_header_provider"] = kwargs.get("skill_header_provider")
+        captured["backend_context"] = kwargs.get("backend_context")
         return original_agent(**kwargs)
 
     provider = MagicMock(return_value=None)
@@ -93,6 +99,7 @@ def test_build_email_agent_runner_passes_workspace_and_skill_provider_to_agent(m
     assert captured["system_prompt"] == "base-system"
     assert captured["workspace_path"] == tmp_path
     assert captured["skill_header_provider"] is provider
+    assert captured["backend_context"] == {"sender_id": "alice@example.com", "thread_id": "thread-1"}
     provider.assert_called_once_with("find me a skill", tmp_path)
 
 
@@ -110,12 +117,17 @@ def test_build_email_agent_runner_skips_skill_provider_for_image_only_message(tm
         workspace_path=tmp_path,
         skill_header_provider=provider,
     )
-    image_only_msg = {"id": 1, "content": [{"content_type": "image", "content": "photo.jpg"}]}
+    image_only_msg = {
+        "id": 1,
+        "thread_id": "thread-1",
+        "sender_id": "alice@example.com",
+        "content": [{"content_type": "image", "content": "photo.jpg"}],
+    }
     run_agent([image_only_msg], image_only_msg)
     provider.assert_called_once_with("[image: photo.jpg]", tmp_path)
 
 
-def test_create_tooling_registers_embed_text_in_main_and_sub_tools(monkeypatch):
+def test_create_tooling_registers_search_and_embed_tools_in_main_and_sub_tools(monkeypatch):
     created_clients = [_fake_chat_client(), _fake_chat_client(), MagicMock()]
     monkeypatch.setattr(main_module, "create_openai_client", lambda url, key: created_clients.pop(0))
 
@@ -125,11 +137,15 @@ def test_create_tooling_registers_embed_text_in_main_and_sub_tools(monkeypatch):
     sub_names = {tool["function"]["name"] for tool in tooling["sub_tools"]}
     assert "embed_text" in main_names
     assert "embed_text" in sub_names
+    assert "search_chat_history" in main_names
+    assert "search_chat_history" in sub_names
     assert "embed_text" in tooling["main_handlers"]
     assert "embed_text" in tooling["sub_handlers"]
+    assert "search_chat_history" in tooling["main_handlers"]
+    assert "search_chat_history" in tooling["sub_handlers"]
 
 
-def test_create_tooling_uses_configured_embedding_api_for_embed_text_and_skill_headers(monkeypatch, tmp_path):
+def test_create_tooling_uses_dedicated_embedding_api_for_embed_text_and_skill_headers(monkeypatch, tmp_path):
     main_client = _fake_chat_client()
     sub_client = _fake_chat_client()
     embedding_client = MagicMock()
@@ -154,7 +170,28 @@ def test_create_tooling_uses_configured_embedding_api_for_embed_text_and_skill_h
     assert "[Relevant skills]" in header
     assert "Calculator" in header
     assert embedding_client.embeddings.create.call_args_list == [
-        call(model="embed-model", input=["hello world"]),
-        call(model="embed-model", input=["arithmetic please"]),
-        call(model="embed-model", input=["Calculator. Does arithmetic."]),
+        call(model="embed-model", input=["title: none | text: hello world"]),
+        call(model="embed-model", input=["task: search result | query: arithmetic please"]),
+        call(model="embed-model", input=["title: none | text: Calculator. Does arithmetic."]),
     ]
+
+
+def test_build_email_agent_runner_uses_history_builder(tmp_path):
+    provider = MagicMock(return_value=None)
+    history_builder = MagicMock(return_value=[{"role": "system", "content": "summary"}])
+    run_agent = main_module.build_email_agent_runner(
+        openai_client=_fake_chat_client(),
+        model="model",
+        system_prompt="base-system",
+        tools=[],
+        tool_handlers={},
+        container_runner=None,
+        max_depth=1,
+        max_children=1,
+        workspace_path=tmp_path,
+        skill_header_provider=provider,
+        history_builder=history_builder,
+    )
+    message = _make_message("hello")
+    run_agent([message], message)
+    history_builder.assert_called_once_with([], message)

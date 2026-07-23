@@ -13,17 +13,18 @@ import threading
 import traceback
 from typing import Any, Callable
 
-from backhead import db, mail
+from backhead import chat_history, db, mail
 from backhead import media as media_mod
 from backhead.agent_loop import Agent, DEFAULT_SYSTEM_PROMPT, messages_to_openai_messages
 from backhead.bootstrap import STATE_DIR
 from backhead.bootstrap import ensure_runtime, open_db_connection, resolve_workspace_host_path
-from backhead.embeddings import create_openai_embed_fn
+from backhead.embeddings import create_document_embed_fn, create_query_embed_fn
 from backhead.llm import create_openai_client
 from backhead.private_config import CONFIG, AppConfig
 from backhead.skills import generate_skill_header
 from backhead.tools.cli_tool import create_cli_tool
 from backhead.tools.embed_tool import create_embed_tool
+from backhead.tools.search_chat_history import create_search_chat_history_tool
 from backhead.tools.spawn_subagent import create_spawn_subagent_tool
 
 MEDIA_ROOT = STATE_DIR
@@ -50,6 +51,8 @@ class RuntimeContext:
         self.queue_lock = asyncio.Lock()
         self.thread_queues: dict[str, deque[QueuedEmailJob]] = defaultdict(deque)
         self.semaphore = asyncio.Semaphore(config.maximum_concurrent_conversations)
+        self.document_embed_fn: Callable[[list[str]], Any] | None = None
+        self.query_embed_fn: Callable[[list[str]], Any] | None = None
 
 
 def _db_call(runtime: RuntimeContext, func: Callable[..., Any], *args, **kwargs):
@@ -100,10 +103,15 @@ def build_email_agent_runner(
     media_root: Path | None = None,
     workspace_path: Path | None = None,
     skill_header_provider: Any = None,
+    history_builder: Callable[[list[dict], dict], list[dict]] | None = None,
 ):
     def run_agent(history: list[dict], current_message: dict) -> str:
         prior = [row for row in history if row["id"] != current_message["id"]]
-        prior_messages = messages_to_openai_messages(prior, media_root=media_root)
+        prior_messages = (
+            history_builder(prior, current_message)
+            if history_builder is not None
+            else messages_to_openai_messages(prior, media_root=media_root)
+        )
 
         agent = Agent(
             openai_client=openai_client,
@@ -118,6 +126,10 @@ def build_email_agent_runner(
             depth=0,
             max_depth=max_depth,
             max_children=max_children,
+            backend_context={
+                "sender_id": current_message.get("sender_id"),
+                "thread_id": current_message.get("thread_id"),
+            },
         )
         prompt = _current_message_prompt(current_message, media_root)
         return agent.run(prompt)
@@ -149,14 +161,15 @@ def create_podman_runner(container_name: str, timeout_seconds: int = 300):
     return run_in_container
 
 
-def create_tooling(*, config: AppConfig, container_runner):
+def create_tooling(*, config: AppConfig, container_runner, runtime: RuntimeContext | None = None):
     main_client = create_openai_client(config.main_agent.base_url, config.main_agent.api_key)
     sub_client = create_openai_client(config.subagent.base_url, config.subagent.api_key)
-    embedding_client = create_openai_client(config.main_agent.base_url, config.main_agent.api_key)
-    embed_fn = create_openai_embed_fn(embedding_client, config.embedding_model)
+    embedding_client = create_openai_client(config.embedding_endpoint.base_url, config.embedding_endpoint.api_key)
+    document_embed_fn = create_document_embed_fn(embedding_client, config.embedding_endpoint.model)
+    query_embed_fn = create_query_embed_fn(embedding_client, config.embedding_endpoint.model)
 
     cli_schema, cli_handler = create_cli_tool(container_runner)
-    embed_schema, embed_handler = create_embed_tool(embed_fn)
+    embed_schema, embed_handler = create_embed_tool(document_embed_fn)
 
     def skill_header_provider(prompt_text: str, workspace_path: Path) -> str | None:
         try:
@@ -164,14 +177,36 @@ def create_tooling(*, config: AppConfig, container_runner):
                 prompt_text,
                 workspace_path,
                 min_similarity=config.skill_similarity_threshold,
-                embed_fn=embed_fn,
+                query_embed_fn=query_embed_fn,
+                document_embed_fn=document_embed_fn,
             )
         except Exception as exc:  # noqa: BLE001
             print(f"Skill-header generation failed: {exc}")
             return None
 
-    subagent_tools: list[dict] = [cli_schema, embed_schema]
-    subagent_handlers: dict[str, Any] = {"run_cli": cli_handler, "embed_text": embed_handler}
+    def search_fn(*, sender_id: str, thread_id: str, query: str, max_results: int) -> list[dict]:
+        if runtime is None:
+            raise RuntimeError("Runtime context is not configured.")
+        return chat_history.search_previous_conversations(
+            runtime.conn,
+            db_lock=runtime.db_lock,
+            sender_id=sender_id,
+            current_thread_id=thread_id,
+            query=query,
+            query_embed_fn=query_embed_fn,
+            document_embed_fn=document_embed_fn,
+            embedding_model=config.embedding_endpoint.model,
+            limit=max_results,
+        )
+
+    search_schema, search_handler = create_search_chat_history_tool(search_fn if runtime is not None else None)
+
+    subagent_tools: list[dict] = [cli_schema, embed_schema, search_schema]
+    subagent_handlers: dict[str, Any] = {
+        "run_cli": cli_handler,
+        "embed_text": embed_handler,
+        "search_chat_history": search_handler,
+    }
     spawn_schema, spawn_handler = create_spawn_subagent_tool(
         openai_client=sub_client,
         model=config.subagent.model,
@@ -187,8 +222,13 @@ def create_tooling(*, config: AppConfig, container_runner):
     subagent_tools.append(spawn_schema)
     subagent_handlers["spawn_subagent"] = spawn_handler
 
-    main_tools = [cli_schema, spawn_schema, embed_schema]
-    main_handlers = {"run_cli": cli_handler, "spawn_subagent": spawn_handler, "embed_text": embed_handler}
+    main_tools = [cli_schema, spawn_schema, embed_schema, search_schema]
+    main_handlers = {
+        "run_cli": cli_handler,
+        "spawn_subagent": spawn_handler,
+        "embed_text": embed_handler,
+        "search_chat_history": search_handler,
+    }
 
     return {
         "main_client": main_client,
@@ -198,7 +238,21 @@ def create_tooling(*, config: AppConfig, container_runner):
         "sub_tools": subagent_tools,
         "sub_handlers": subagent_handlers,
         "skill_header_provider": skill_header_provider,
+        "document_embed_fn": document_embed_fn,
+        "query_embed_fn": query_embed_fn,
     }
+
+
+def _refresh_message_embeddings(runtime: RuntimeContext, sender_id: str) -> None:
+    if runtime.document_embed_fn is None:
+        return
+    chat_history.ensure_message_embeddings(
+        runtime.conn,
+        db_lock=runtime.db_lock,
+        sender_id=sender_id,
+        document_embed_fn=runtime.document_embed_fn,
+        embedding_model=runtime.config.embedding_endpoint.model,
+    )
 
 
 async def _pop_next_job(runtime: RuntimeContext, thread_id: str) -> QueuedEmailJob | None:
@@ -222,6 +276,7 @@ async def _process_conversation(runtime: RuntimeContext, thread_id: str, run_age
                 continue
 
             try:
+                await asyncio.to_thread(_refresh_message_embeddings, runtime, current_message["sender_id"])
                 reply_text = await asyncio.to_thread(run_agent, history, current_message)
                 outgoing, _ = mail.build_reply_email(
                     from_address=runtime.config.email_account.address,
@@ -245,6 +300,7 @@ async def _process_conversation(runtime: RuntimeContext, thread_id: str, run_age
                     timestamp=ts,
                     content_parts=[("text", reply_text)],
                 )
+                await asyncio.to_thread(_refresh_message_embeddings, runtime, job.transport.sender_id)
             except Exception:  # noqa: BLE001
                 traceback_text = traceback.format_exc()
                 LOGGER.exception("Failed to process message %s in thread %s", job.message_id, thread_id)
@@ -290,6 +346,7 @@ async def _send_request_error_response(
             timestamp=ts,
             content_parts=[("text", traceback_text)],
         )
+        await asyncio.to_thread(_refresh_message_embeddings, runtime, job.transport.sender_id)
     except Exception as exc:  # noqa: BLE001
         LOGGER.error(
             "Failed to persist request error response for message %s in thread %s: %r",
@@ -351,7 +408,25 @@ async def run_backend(config: AppConfig = CONFIG) -> None:
     conn = open_db_connection()
     runtime = RuntimeContext(config, conn)
     container_runner = create_podman_runner(config.podman_container_name)
-    tooling = create_tooling(config=config, container_runner=container_runner)
+    tooling = create_tooling(config=config, container_runner=container_runner, runtime=runtime)
+    runtime.document_embed_fn = tooling["document_embed_fn"]
+    runtime.query_embed_fn = tooling["query_embed_fn"]
+
+    def history_builder(prior: list[dict], current_message: dict) -> list[dict]:
+        compaction = chat_history.ensure_conversation_compaction(
+            runtime.conn,
+            db_lock=runtime.db_lock,
+            channel="email",
+            thread_id=current_message["thread_id"],
+            sender_id=current_message["sender_id"],
+            conversation=prior,
+        )
+        return chat_history.build_compacted_openai_history(
+            prior,
+            compaction=compaction,
+            recent_messages_to_openai=lambda rows: messages_to_openai_messages(rows, media_root=MEDIA_ROOT),
+        )
+
     run_agent = build_email_agent_runner(
         openai_client=tooling["main_client"],
         model=config.main_agent.model,
@@ -364,6 +439,7 @@ async def run_backend(config: AppConfig = CONFIG) -> None:
         media_root=MEDIA_ROOT,
         workspace_path=resolve_workspace_host_path(config),
         skill_header_provider=tooling["skill_header_provider"],
+        history_builder=history_builder,
     )
 
     while True:
