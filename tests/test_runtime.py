@@ -167,7 +167,7 @@ def test_failure_is_replied_to_without_persistent_retry(monkeypatch):
     assert history[1]["content"][0]["content"].endswith("RuntimeError: temporary failure\n")
 
 
-def test_fatal_request_error_is_replied_with_full_traceback_and_processing_continues(monkeypatch):
+def test_fatal_error_sends_traceback_and_continues(monkeypatch):
     conn = _conn()
     first = _queue_message(conn, "alice@example.com", "<fail@example.com>", "fail", timestamp=1)
     second = mail.store_incoming_email(
@@ -212,7 +212,7 @@ def test_fatal_request_error_is_replied_with_full_traceback_and_processing_conti
     assert history[3]["content"][0]["content"] == "reply:next"
 
 
-def test_error_response_smtp_failure_is_logged(monkeypatch, capsys):
+def test_error_response_smtp_failure_is_logged(monkeypatch, caplog):
     conn = _conn()
     queued = _queue_message(conn, "alice@example.com", "<fail@example.com>", "fail", timestamp=1)
     runtime = RuntimeContext(_config(), conn)
@@ -224,8 +224,7 @@ def test_error_response_smtp_failure_is_logged(monkeypatch, capsys):
 
     asyncio.run(_send_request_error_response(runtime, QueuedEmailJob(queued["message_id"], queued["transport"]), queued["thread_id"], "trace"))
 
-    captured = capsys.readouterr()
-    assert "Failed to send email request error response" in captured.out
+    assert "Failed to send email request error response" in caplog.text
     history = db.get_conversation(conn, "email", queued["thread_id"])
     assert [row["role"] for row in history] == ["user"]
 
