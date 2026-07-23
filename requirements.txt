@@ -1,5 +1,4 @@
 openai
 numpy
 PyYAML
-sentence-transformers
 pytest

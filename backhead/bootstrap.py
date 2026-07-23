@@ -21,7 +21,7 @@ BACKEND_PATH = (REPO_ROOT / "backhead").resolve()
 IMAGE_FINGERPRINT_LABEL = "io.github.esrla.podhead.runtime-fingerprint"
 IMAGE_BUILD_INPUTS = (
     CONTAINERFILE_PATH,
-    REPO_ROOT / "requirements.txt",
+    REPO_ROOT / "container-requirements.txt",
 )
 
 
@@ -46,6 +46,7 @@ def validate_config(config: AppConfig) -> None:
         config.main_agent.model,
         config.subagent.api_key,
         config.subagent.model,
+        config.embedding_model,
         config.email_account.password,
         config.imap.password,
         config.smtp.password,
@@ -56,6 +57,10 @@ def validate_config(config: AppConfig) -> None:
         raise ValueError("workspace_path must not be empty.")
     if not config.spam_mailbox.strip():
         raise ValueError("spam_mailbox must not be empty.")
+    if not config.embedding_model.strip():
+        raise ValueError("embedding_model must not be empty.")
+    if not 0.0 <= config.skill_similarity_threshold <= 1.0:
+        raise ValueError("skill_similarity_threshold must be between 0.0 and 1.0.")
 
 
 def resolve_workspace_host_path(config: AppConfig) -> Path:

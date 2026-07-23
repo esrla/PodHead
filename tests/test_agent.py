@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest.mock import MagicMock
 
 from backhead.agent_loop import (
+    AGENT_WORKSPACE_GUIDE,
+    DEFAULT_SYSTEM_PROMPT,
     Agent,
     HISTORY_SEPARATOR,
     build_execution_tree,
@@ -65,6 +68,17 @@ def _msg(role, *parts):
     ]}
 
 
+def _skill_header(prompt_text, workspace_path):
+    return f"[Relevant skills]\nname: {prompt_text}\npath: /workspace/skills/{Path(workspace_path).name}/SKILL.md"
+
+
+def test_default_system_prompt_mentions_skill_headers_and_workspace_root():
+    assert AGENT_WORKSPACE_GUIDE in DEFAULT_SYSTEM_PROMPT
+    assert "headers only" in DEFAULT_SYSTEM_PROMPT
+    assert "do not infer the skill body" in DEFAULT_SYSTEM_PROMPT
+    assert "/workspace" in DEFAULT_SYSTEM_PROMPT
+
+
 def test_tool_error_result_structure():
     assert tool_error_result("tool_execution_error", "Command failed.", "details") == {
         "ok": False,
@@ -100,12 +114,53 @@ def test_messages_to_openai_collapses_consecutive_roles():
     ]
 
 
-def test_spawn_subagent_starts_fresh_history_and_uses_configured_model():
+def test_agent_injects_skills_from_its_startup_prompt_once(tmp_path):
+    client, completions = _fake_client(_FakeResponse("Hello"), _FakeResponse("Again"))
+    calls = []
+
+    def tracking_header(prompt_text, workspace_path):
+        calls.append((prompt_text, workspace_path))
+        return _skill_header(prompt_text, workspace_path)
+
+    agent = Agent(
+        openai_client=client,
+        model="main-model",
+        system_prompt="sys",
+        workspace_path=tmp_path,
+        skill_header_provider=tracking_header,
+    )
+
+    assert agent.run("Hi") == "Hello"
+    assert agent.run("Later") == "Again"
+    assert calls == [("Hi", tmp_path)]
+    assert "name: Hi" in completions.calls[0]["messages"][0]["content"]
+    assert "name: Hi" in completions.calls[1]["messages"][0]["content"]
+
+
+def test_agent_skips_skill_injection_for_image_only_prompt(tmp_path):
+    client, completions = _fake_client(_FakeResponse("done"))
+    calls = []
+    agent = Agent(
+        openai_client=client,
+        model="main-model",
+        system_prompt="sys",
+        workspace_path=tmp_path,
+        skill_header_provider=lambda prompt, workspace: calls.append(prompt),
+    )
+    prompt = [{"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}]
+    agent.run(prompt)
+    assert calls == []
+    assert completions.calls[0]["messages"][0]["content"] == "sys"
+
+
+def test_spawn_subagent_starts_fresh_history_uses_configured_model_and_its_prompt_for_injection(tmp_path):
     sub_client, completions = _fake_client(_FakeResponse("child done"))
     _, handler = create_spawn_subagent_tool(
         openai_client=sub_client,
         model="sub-model",
         system_prompt="sub-system",
+        workspace_path=tmp_path,
+        skill_header_provider=_skill_header,
         tools=[],
         tool_handlers={},
         container_runner=None,
@@ -123,9 +178,10 @@ def test_spawn_subagent_starts_fresh_history_and_uses_configured_model():
     assert result == {"ok": True, "response": "child done"}
     assert completions.calls[0]["model"] == "sub-model"
     assert [m["content"] for m in completions.calls[0]["messages"] if m["role"] == "user"] == ["subtask"]
+    assert "name: subtask" in completions.calls[0]["messages"][0]["content"]
 
 
-def test_subagents_can_call_spawn_subagent_recursively():
+def test_nested_subagents_receive_independently_matched_skills(tmp_path):
     sub_client, completions = _fake_client(
         _FakeResponse(None, [_FakeToolCall("outer", "spawn_subagent", {"prompt": "inner"})]),
         _FakeResponse("inner complete"),
@@ -137,6 +193,8 @@ def test_subagents_can_call_spawn_subagent_recursively():
         openai_client=sub_client,
         model="sub-model",
         system_prompt="sub-system",
+        workspace_path=tmp_path,
+        skill_header_provider=_skill_header,
         tools=sub_tools,
         tool_handlers=sub_handlers,
         container_runner=None,
@@ -149,15 +207,18 @@ def test_subagents_can_call_spawn_subagent_recursively():
     parent = Agent(openai_client=MagicMock(), model="parent-model", system_prompt="parent-system")
     result = handler({"prompt": "outer"}, parent)
     assert result == {"ok": True, "response": "outer complete"}
-    assert len(completions.calls) == 3
+    assert "name: outer" in completions.calls[0]["messages"][0]["content"]
+    assert "name: inner" in completions.calls[1]["messages"][0]["content"]
 
 
-def test_spawn_limits_are_enforced():
+def test_spawn_limits_are_enforced(tmp_path):
     sub_client = MagicMock()
     _, handler = create_spawn_subagent_tool(
         openai_client=sub_client,
         model="sub-model",
         system_prompt="sub-system",
+        workspace_path=tmp_path,
+        skill_header_provider=_skill_header,
         tools=[],
         tool_handlers={},
         container_runner=None,
@@ -238,7 +299,7 @@ def test_execution_tree_included_with_required_heading_when_tools_used():
     assert reply.endswith("\n---\ndone")
 
 
-def test_execution_tree_shows_subagent_subtree():
+def test_execution_tree_shows_subagent_subtree(tmp_path):
     sub_client, _ = _fake_client(
         _FakeResponse(None, [_FakeToolCall("s1", "run_cli", {"command": "pwd"})]),
         _FakeResponse("child reply"),
@@ -253,6 +314,8 @@ def test_execution_tree_shows_subagent_subtree():
         openai_client=sub_client,
         model="sub-model",
         system_prompt="sub",
+        workspace_path=tmp_path,
+        skill_header_provider=_skill_header,
         tools=sub_tools,
         tool_handlers=sub_handlers,
         container_runner=None,

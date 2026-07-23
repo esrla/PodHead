@@ -1,9 +1,4 @@
-"""Backend tool: embed_text.
-
-A narrow backend tool that computes a normalized semantic embedding vector
-for arbitrary text supplied by the agent. The embedding is computed entirely
-inside the trusted backend; the container never has direct model access.
-"""
+"""Backend tool: embed_text."""
 
 from __future__ import annotations
 
@@ -16,7 +11,7 @@ EMBED_TOOL_SCHEMA: dict[str, Any] = {
     "function": {
         "name": "embed_text",
         "description": (
-            "Return a normalized semantic embedding vector for the given text. "
+            "Return a semantic embedding vector for the given text. "
             "Useful for computing similarity scores or comparing texts semantically."
         ),
         "parameters": {
@@ -37,8 +32,8 @@ EMBED_TOOL_SCHEMA: dict[str, Any] = {
 def create_embed_tool(embed_fn: Callable) -> tuple[dict, Any]:
     """Return (schema, handler) for the embed_text tool.
 
-    ``embed_fn(texts: list[str]) -> np.ndarray`` must match the signature of
-    ``backhead.skills.embed``.
+    ``embed_fn(texts: list[str]) -> np.ndarray`` must return backend-generated
+    embedding vectors from the configured embeddings API.
     """
 
     def handler(args: dict, calling_agent: Any) -> dict:
