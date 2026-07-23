@@ -22,7 +22,7 @@ PODHEAD ARCHITECTURE — single-file spec
 - Backend (admin-owned) provides:
   - trigger polling (IMAP for email initially)
   - outbound sending (SMTP for email initially)
-  - LLM proxy (chat completions)
+  - LLM proxy (chat completions and embeddings)
   - the SQLite database (append-only)
   - attachment handling (decode/normalize images)
   - agent CLI runner (run_cli in container)
@@ -135,7 +135,7 @@ Notes:
 10) Tools / scripts model
 - Built-in runtime capability: run_cli executes commands inside the Podman workspace container.
 - spawn_subagent: spawns a fresh Agent context for a subtask; child prompt is the only model-provided parameter.
-- embed_text: backend tool that returns a normalized semantic embedding vector for the given text; the computation runs entirely inside the trusted backend, not in the container.
+- embed_text: backend tool that returns the configured backend embedding vector for the given text; the computation runs entirely inside the trusted backend, not in the container.
 - Everything else is implemented as scripts under head_pod/tools/ and executed via run_cli.
 - head_pod/tools/tools.md is the registry of scripts and how to invoke them (maintained by the agent).
 
@@ -173,19 +173,24 @@ spawn_subagent contract:
 
 
 13) Skill-header sidecars (must be on backend side)
-- Before each incoming user message is dispatched to the main LLM, the trusted backend generates a skill-header sidecar.
-- The sidecar queries the skills/ directory in the workspace and selects the top-N skills most relevant to the message text.
-- Relevance is determined by cosine similarity between a normalized embedding of the message text and each skill's cached embedding.
-- Skills are ranked and the top matches are formatted as a compact block of names and descriptions.
-- The sidecar is injected into the system prompt for the current turn only; prior conversation turns are not affected.
-- Skill embeddings are cached beside their SKILL.md as .embed.npy; the cache is invalidated whenever SKILL.md is newer than the cache file.
-- If the workspace has no skills/ directory, or the directory contains no valid SKILL.md files, no sidecar is generated and the system prompt is unmodified.
+- At the beginning of an agent instance's first run(prompt), the trusted backend embeds that startup prompt and matches it against skills/ under the configured workspace.
+- This applies equally to the main agent, subagents, and nested subagents.
+- Only SKILL.md frontmatter is embedded, using the exact text "{name}. {description}" for each skill.
+- The backend uses the configured OpenAI-compatible embeddings API for prompt embeddings, skill embeddings, and embed_text.
+- Skill embeddings are cached beside their SKILL.md as .embed.npy and regenerated when missing, outdated, unreadable, malformed, non-finite, or dimensionally incompatible with the current query embedding.
+- Relevance is determined by cosine similarity after normalizing both the query embedding and each skill embedding.
+- Only skills at or above the configured similarity threshold are kept; zero matches is valid.
+- Matching skills are sorted descending and formatted without truncating the result set:
+  - 20 or fewer: name, description, path
+  - 21 through 100: name, path
+  - more than 100: name
+- Automatic injection includes only formatted skill headers in a [Relevant skills] section; it never injects SKILL.md bodies or other workspace files.
+- If no skills match, no relevant-skills section is injected.
 - If sidecar generation raises an exception the backend falls back silently and dispatches the message with the unmodified system prompt.
-- The sidecar is generated entirely inside the trusted backend; the agent workspace is read but never written during sidecar generation.
 
 embed_text backend tool contract:
 - Input: text (string)
-- Output: {"ok": true, "embedding": [float, ...]} — a normalized embedding vector
+- Output: {"ok": true, "embedding": [float, ...]}
 - The computation runs in the trusted backend; the container never has direct model access.
 - Both the main agent and subagents may call embed_text.
 
@@ -251,8 +256,7 @@ Core operations:
 - messages_to_openai_messages(conversation, media_root) -> list[dict]
 - save_image(data, media_root) -> str | None
 - load_image_as_base64(relative_path, media_root) -> str | None
-- generate_skill_header(message_text, workspace_path, top) -> str | None
-- embed(texts) -> np.ndarray
+- generate_skill_header(message_text, workspace_path, min_similarity) -> str | None
 
 
 18) Installation

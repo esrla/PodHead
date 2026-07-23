@@ -112,7 +112,7 @@ def test_build_email_agent_runner_skips_skill_provider_for_image_only_message(tm
     )
     image_only_msg = {"id": 1, "content": [{"content_type": "image", "content": "photo.jpg"}]}
     run_agent([image_only_msg], image_only_msg)
-    provider.assert_not_called()
+    provider.assert_called_once_with("[image: photo.jpg]", tmp_path)
 
 
 def test_create_tooling_registers_embed_text_in_main_and_sub_tools(monkeypatch):

@@ -21,6 +21,8 @@ The configuration defines:
 
 - main-agent endpoint and model
 - subagent endpoint and model
+- shared embedding model
+- skill similarity threshold
 - one PodHead email account
 - IMAP settings
 - SMTP settings

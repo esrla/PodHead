@@ -35,9 +35,9 @@ class TestParseFrontmatter:
 
 class TestFindSkills:
     def test_finds_valid_skills(self, tmp_path):
-        _write_skill(tmp_path / "calc", "Calculator", "Does arithmetic.")
-        skills = find_skills(tmp_path)
-        assert skills[0]["path"] == "/workspace/calc/SKILL.md"
+        _write_skill(tmp_path / "skills" / "calc", "Calculator", "Does arithmetic.")
+        skills = find_skills(tmp_path / "skills")
+        assert skills[0]["path"] == "/workspace/skills/calc/SKILL.md"
 
     def test_skips_skill_missing_required_frontmatter(self, tmp_path):
         _write_skill(tmp_path / "ok", "Good Skill", "Has both fields.")
