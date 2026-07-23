@@ -97,6 +97,23 @@ def test_ensure_container_image_skips_rebuild_when_fingerprint_matches(monkeypat
     assert (image_id, rebuilt) == ("image-1", False)
 
 
+def test_runtime_fingerprint_changes_only_for_container_build_inputs(monkeypatch, tmp_path):
+    containerfile = tmp_path / "Containerfile"
+    container_reqs = tmp_path / "container-requirements.txt"
+    backend_reqs = tmp_path / "requirements.txt"
+    containerfile.write_text("FROM python:3.12-slim\n")
+    container_reqs.write_text("numpy\n")
+    backend_reqs.write_text("openai\n")
+    monkeypatch.setattr(bootstrap, "IMAGE_BUILD_INPUTS", (containerfile, container_reqs))
+
+    original = bootstrap._runtime_fingerprint()
+    backend_reqs.write_text("openai\npytest\n")
+    assert bootstrap._runtime_fingerprint() == original
+
+    container_reqs.write_text("numpy\nPyYAML\n")
+    assert bootstrap._runtime_fingerprint() != original
+
+
 def test_ensure_runtime_leaves_valid_running_container_unchanged(monkeypatch, tmp_path):
     calls = []
     config = _config(workspace_path=str(tmp_path / "ws"))

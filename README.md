@@ -2,6 +2,8 @@
 
 PodHead is an email-driven agent backend with a strict split between backend code and an isolated Podman workspace.
 
+llama.cpp, through its OpenAI-compatible embeddings endpoint, is the only production embedding provider.
+
 ## Backend entrypoint
 
 PodHead has one user-facing startup command:
@@ -21,7 +23,7 @@ The configuration defines:
 
 - main-agent endpoint and model
 - subagent endpoint and model
-- shared embedding model
+- llama.cpp-compatible embedding model
 - skill similarity threshold
 - one PodHead email account
 - IMAP settings
@@ -54,6 +56,7 @@ Persisted email history is loaded from SQLite for the main agent, while subagent
 - `spawn_subagent` accepts only `{"prompt": "..."}` from the model.
 - The backend chooses each agent's OpenAI-compatible client, model, system prompt, and tools.
 - Tool failures are returned to the agent as structured tool-result messages.
+- `embed_text` and skill matching use the configured llama.cpp/OpenAI-compatible embeddings endpoint and embedding model.
 - `run_cli` executes commands only through the configured Podman container.
 
 ## Container boundary
@@ -65,6 +68,28 @@ The backend verifies that:
 - `head_pod` is mounted to `/workspace`
 - backend code and `backhead/private_config.py` are not mounted into the container
 - `/workspace/AGENT.md` exists inside the container
+
+## Installation and tests
+
+Install backend and test dependencies from the repository root with:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+Install container-only dependencies inside the image with:
+
+```bash
+python -m pip install -r container-requirements.txt
+```
+
+## Request failures
+
+- Any exception that prevents a normal reply for the current email request is caught at the outer request boundary.
+- The complete original exception, including its full Python stack trace, is returned through the same email thread unchanged.
+- If sending that error reply fails, PodHead logs the send failure and continues without retrying the error reply.
+- One failed request does not stop the main polling loop or the PodHead process.
+- Tool and skill errors that the agent can still handle continue to flow back to the agent as tool results.
 
 ## Tests
 

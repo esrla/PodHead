@@ -48,7 +48,7 @@ tool directly accessible to the agent without going through the container:
 embed_text(text: str) -> {"ok": true, "embedding": [float, ...]}
 ```
 
-Returns a normalized semantic embedding vector for `text`. Useful for comparing
+Returns the backend-generated semantic embedding vector for `text`. Useful for comparing
 texts by cosine similarity (e.g. `sum(a*b for a, b in zip(vec_a, vec_b))`),
 finding relevant content, or working alongside the skill search script.
 
@@ -57,20 +57,13 @@ finding relevant content, or working alongside the skill search script.
 Use the skill search script to find the most relevant skill for a task:
 
 ```
-python /workspace/tools/find_skill.py "your query here"
+python /workspace/tools/find_skill.py '[0.1, 0.2, 0.3]'
 ```
 
-Options:
-
-| Flag           | Default             | Description                  |
-|----------------|---------------------|------------------------------|
-| `--top N`      | 5                   | Number of results to return  |
-| `--skills-dir` | `/workspace/skills` | Skills root directory        |
-
 The script reads the `name` and `description` from each `SKILL.md` frontmatter, generates
-one multilingual embedding per skill (stored as `.embed.npy` beside `SKILL.md`), and
-returns the top N matches for the query. Embeddings are regenerated automatically when
-`SKILL.md` is newer than the cached file.
+one backend-generated embedding per skill (stored as `.embed.npy` beside `SKILL.md`), and
+returns every match at or above the configured similarity threshold. Embeddings are regenerated
+automatically when `SKILL.md` is newer than the cached file.
 
 ## Extending the Workspace
 
