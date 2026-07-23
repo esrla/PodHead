@@ -22,8 +22,10 @@ PODHEAD ARCHITECTURE — single-file spec
 - Backend (admin-owned) provides:
   - trigger polling (IMAP for email initially)
   - outbound sending (SMTP for email initially)
-  - LLM proxy (chat completions and embeddings)
-  - the SQLite database (append-only)
+  - LLM proxy (chat completions and dedicated embeddings)
+  - the SQLite database (append-only source of truth)
+  - message embeddings and semantic search side data
+  - persistent conversation compaction side data
   - attachment handling (decode/normalize images)
   - agent CLI runner (run_cli in container)
   - config loader (backhead/private_config.py)
@@ -113,6 +115,8 @@ Notes:
 - Message order is messages.id; content order is message_content.ordinal.
 - Timestamp is stored in the backend's local timezone with offset but does not control order.
 - Image content is a relative backend-owned media path; base64 is generated at the LLM boundary.
+- message_embeddings stores one current float32 embedding blob per message as backend-owned side data.
+- conversation_compactions stores backend-generated compact summaries used for prompt construction while leaving stored messages unchanged.
 - Consecutive same-role messages are merged during context construction.
 
 
@@ -136,6 +140,7 @@ Notes:
 - Built-in runtime capability: run_cli executes commands inside the Podman workspace container.
 - spawn_subagent: spawns a fresh Agent context for a subtask; child prompt is the only model-provided parameter.
 - embed_text: backend tool that returns the configured backend embedding vector for the given text; the computation runs entirely inside the trusted backend, not in the container.
+- search_chat_history: backend tool that semantically searches previous conversations for the current sender; embeddings, search, and filtering remain entirely inside the trusted backend.
 - Everything else is implemented as scripts under head_pod/tools/ and executed via run_cli.
 - head_pod/tools/tools.md is the registry of scripts and how to invoke them (maintained by the agent).
 
@@ -176,8 +181,8 @@ spawn_subagent contract:
 - At the beginning of an agent instance's first run(prompt), the trusted backend embeds that startup prompt and matches it against skills/ under the configured workspace.
 - This applies equally to the main agent, subagents, and nested subagents.
 - Only SKILL.md frontmatter is embedded, using the exact text "{name}. {description}" for each skill.
-- The backend uses the configured OpenAI-compatible embeddings API for prompt embeddings, skill embeddings, and embed_text.
-- llama.cpp, through that OpenAI-compatible embeddings API, is the only production embedding provider.
+- The backend uses the dedicated configured OpenAI-compatible embeddings API for prompt embeddings, skill embeddings, chat-history embeddings, semantic search queries, and embed_text.
+- llama.cpp, through that dedicated OpenAI-compatible embeddings API, is the only production embedding provider.
 - Skill embeddings are cached beside their SKILL.md as .embed.npy and regenerated when missing, outdated, unreadable, malformed, non-finite, or dimensionally incompatible with the current query embedding.
 - Relevance is determined by cosine similarity after normalizing both the query embedding and each skill embedding.
 - Only skills at or above the configured similarity threshold are kept; zero matches is valid.
@@ -263,8 +268,9 @@ Core operations:
 - See GETTING-STARTED.md for full setup.
 - Start with: python -m backhead.main
 - backhead.main automatically runs bootstrap before starting the backend.
-- Bootstrap prepares local runtime requirements: local directories, database, Podman image, container, workspace mount.
-- It does not test the LLM, IMAP or SMTP services during startup.
+- Bootstrap prepares local runtime requirements: local directories, database, managed llama-server processes, Podman image, container, workspace mount.
+- Bootstrap health-checks configured managed model endpoints and starts missing local chat or embedding servers without replacing healthy external processes.
+- It does not test the IMAP or SMTP services during startup.
 
 
 19) SQLite schema
