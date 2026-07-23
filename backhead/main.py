@@ -244,23 +244,23 @@ async def _process_conversation(runtime: RuntimeContext, thread_id: str, run_age
                     content_parts=[("text", reply_text)],
                 )
             except Exception:  # noqa: BLE001
-                error_text = traceback.format_exc()
-                print(f"Failed to process message {job.message_id} in thread {thread_id}:\n{error_text}", end="")
-                await _send_request_error_response(runtime, job, thread_id, error_text)
+                traceback_text = traceback.format_exc()
+                print(f"Failed to process message {job.message_id} in thread {thread_id}:\n{traceback_text}", end="")
+                await _send_request_error_response(runtime, job, thread_id, traceback_text)
 
 
 async def _send_request_error_response(
     runtime: RuntimeContext,
     job: QueuedEmailJob,
     thread_id: str,
-    error_text: str,
+    traceback_text: str,
 ) -> None:
     try:
         outgoing, _ = mail.build_reply_email(
             from_address=runtime.config.email_account.address,
             to=job.transport.sender_id,
             subject=job.transport.subject,
-            body=error_text,
+            body=traceback_text,
             thread_id=thread_id,
             incoming_message_id=job.transport.incoming_message_id,
             references_header=job.transport.references,
@@ -284,7 +284,7 @@ async def _send_request_error_response(
             sender_id=job.transport.sender_id,
             role="assistant",
             timestamp=ts,
-            content_parts=[("text", error_text)],
+            content_parts=[("text", traceback_text)],
         )
     except Exception as exc:  # noqa: BLE001
         print(
