@@ -4,9 +4,14 @@ import asyncio
 import sqlite3
 import subprocess
 import time
-
 from backhead import db, mail
-from backhead.main import QueuedEmailJob, RuntimeContext, create_podman_runner, schedule_conversation
+from backhead.main import (
+    QueuedEmailJob,
+    RuntimeContext,
+    _send_request_error_response,
+    create_podman_runner,
+    schedule_conversation,
+)
 from backhead.private_config import (
     AgentEndpointConfig,
     AppConfig,
@@ -141,7 +146,7 @@ def test_fifo_processing_within_one_conversation(monkeypatch):
     assert seen == ["first", "second"]
 
 
-def test_failure_is_logged_without_persistent_retry(monkeypatch):
+def test_failure_is_replied_to_without_persistent_retry(monkeypatch):
     conn = _conn()
     queued = _queue_message(conn, "alice@example.com", "<retry@example.com>", "retry me", timestamp=1)
     runtime = RuntimeContext(_config(), conn)
@@ -156,6 +161,70 @@ def test_failure_is_logged_without_persistent_retry(monkeypatch):
         await asyncio.gather(*runtime.processing_tasks.values())
 
     asyncio.run(run_once())
+    history = db.get_conversation(conn, "email", queued["thread_id"])
+    assert [row["role"] for row in history] == ["user", "assistant"]
+    assert history[1]["content"][0]["content"].startswith("Traceback (most recent call last):\n")
+    assert history[1]["content"][0]["content"].endswith("RuntimeError: temporary failure\n")
+
+
+def test_fatal_error_sends_traceback_and_continues(monkeypatch):
+    conn = _conn()
+    first = _queue_message(conn, "alice@example.com", "<fail@example.com>", "fail", timestamp=1)
+    second = mail.store_incoming_email(
+        conn=conn,
+        incoming=mail.IncomingEmail(
+            from_header="alice@example.com",
+            subject="Hello",
+            content_parts=[mail.ContentPart(kind="text", text="next")],
+            message_id="<next@example.com>",
+            in_reply_to=f"<podhead.{first['thread_id']}.token@example.com>",
+            timestamp=2,
+        ),
+        whitelist={"alice@example.com", "bob@example.com"},
+    )
+    runtime = RuntimeContext(_config(), conn)
+    sent_bodies = []
+    monkeypatch.setattr(mail, "send_reply_smtp", lambda outgoing, smtp_config: sent_bodies.append(outgoing.body))
+    _enqueue(runtime, first)
+    _enqueue(runtime, second)
+
+    def run_agent(history, message_row):
+        text = _message_text(message_row)
+        if text == "fail":
+            raise RuntimeError("boom")
+        return f"reply:{text}"
+
+    async def run_test():
+        await schedule_conversation(runtime, first["thread_id"], run_agent)
+        await asyncio.gather(*runtime.processing_tasks.values())
+
+    asyncio.run(run_test())
+
+    assert len(sent_bodies) == 2
+    expected_traceback = sent_bodies[0]
+    assert expected_traceback.startswith("Traceback (most recent call last):\n")
+    assert 'raise RuntimeError("boom")' in expected_traceback
+    assert expected_traceback.endswith("RuntimeError: boom\n")
+    assert sent_bodies[1] == "reply:next"
+    history = db.get_conversation(conn, "email", first["thread_id"])
+    assert [row["role"] for row in history] == ["user", "user", "assistant", "assistant"]
+    assert history[2]["content"][0]["content"] == expected_traceback
+    assert history[3]["content"][0]["content"] == "reply:next"
+
+
+def test_error_response_smtp_failure_is_logged(monkeypatch, caplog):
+    conn = _conn()
+    queued = _queue_message(conn, "alice@example.com", "<fail@example.com>", "fail", timestamp=1)
+    runtime = RuntimeContext(_config(), conn)
+
+    def fail_send(outgoing, smtp_config):
+        raise RuntimeError("smtp down")
+
+    monkeypatch.setattr(mail, "send_reply_smtp", fail_send)
+
+    asyncio.run(_send_request_error_response(runtime, QueuedEmailJob(queued["message_id"], queued["transport"]), queued["thread_id"], "trace"))
+
+    assert "Failed to send email request error response" in caplog.text
     history = db.get_conversation(conn, "email", queued["thread_id"])
     assert [row["role"] for row in history] == ["user"]
 

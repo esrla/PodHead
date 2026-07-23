@@ -177,6 +177,7 @@ spawn_subagent contract:
 - This applies equally to the main agent, subagents, and nested subagents.
 - Only SKILL.md frontmatter is embedded, using the exact text "{name}. {description}" for each skill.
 - The backend uses the configured OpenAI-compatible embeddings API for prompt embeddings, skill embeddings, and embed_text.
+- llama.cpp, through that OpenAI-compatible embeddings API, is the only production embedding provider.
 - Skill embeddings are cached beside their SKILL.md as .embed.npy and regenerated when missing, outdated, unreadable, malformed, non-finite, or dimensionally incompatible with the current query embedding.
 - Relevance is determined by cosine similarity after normalizing both the query embedding and each skill embedding.
 - Only skills at or above the configured similarity threshold are kept; zero matches is valid.
@@ -196,12 +197,11 @@ embed_text backend tool contract:
 
 
 14) Error handling
-- Runtime errors are logged or returned through current error handling.
-- main.py wraps each agent turn in try/except.
-- On exception: send user-friendly error email.
-- Unfinished work is not recovered from SQLite after restart.
-- No database-backed retry queue exists.
-- No persistent email processing state exists.
+- main.py wraps each request at the outer conversation-processing boundary.
+- If a request cannot produce a normal reply, PodHead returns the complete original exception with its full stack trace through the same email thread unchanged.
+- If sending that error reply fails, PodHead logs that failure and continues without recursively retrying the error response.
+- Tool and skill failures that the agent can still handle continue to be returned to the agent as tool results.
+- A failed request ends only that request; the main polling loop keeps running and later requests can still be processed.
 
 
 15) Self-extension

@@ -1,4 +1,7 @@
 **/.embed.npy
 state/
 __pycache__/
+*.pyc
+*.pyo
+*.py[cod]
 .pytest_cache/

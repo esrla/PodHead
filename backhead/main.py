@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 from collections import defaultdict, deque
 from dataclasses import dataclass
+import logging
 from pathlib import Path
 import sqlite3
 import subprocess
 import threading
+import traceback
 from typing import Any, Callable
 
 from backhead import db, mail
@@ -25,6 +27,7 @@ from backhead.tools.embed_tool import create_embed_tool
 from backhead.tools.spawn_subagent import create_spawn_subagent_tool
 
 MEDIA_ROOT = STATE_DIR
+LOGGER = logging.getLogger(__name__)
 
 
 class ContainerExecutionError(RuntimeError):
@@ -242,8 +245,58 @@ async def _process_conversation(runtime: RuntimeContext, thread_id: str, run_age
                     timestamp=ts,
                     content_parts=[("text", reply_text)],
                 )
-            except Exception as exc:  # noqa: BLE001
-                print(f"Failed to process message {job.message_id} in thread {thread_id}: {exc}")
+            except Exception:  # noqa: BLE001
+                traceback_text = traceback.format_exc()
+                LOGGER.exception("Failed to process message %s in thread %s", job.message_id, thread_id)
+                await _send_request_error_response(runtime, job, thread_id, traceback_text)
+
+
+async def _send_request_error_response(
+    runtime: RuntimeContext,
+    job: QueuedEmailJob,
+    thread_id: str,
+    traceback_text: str,
+) -> None:
+    try:
+        outgoing, _ = mail.build_reply_email(
+            from_address=runtime.config.email_account.address,
+            to=job.transport.sender_id,
+            subject=job.transport.subject,
+            body=traceback_text,
+            thread_id=thread_id,
+            incoming_message_id=job.transport.incoming_message_id,
+            references_header=job.transport.references,
+        )
+        await asyncio.to_thread(mail.send_reply_smtp, outgoing, runtime.config.smtp)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.error(
+            "Failed to send email request error response for message %s in thread %s: %r",
+            job.message_id,
+            thread_id,
+            exc,
+        )
+        return
+
+    try:
+        ts = db.now_local_iso()
+        await asyncio.to_thread(
+            _db_call,
+            runtime,
+            db.insert_message_with_content,
+            channel="email",
+            thread_id=thread_id,
+            sender_id=job.transport.sender_id,
+            role="assistant",
+            timestamp=ts,
+            content_parts=[("text", traceback_text)],
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.error(
+            "Failed to persist request error response for message %s in thread %s: %r",
+            job.message_id,
+            thread_id,
+            exc,
+        )
 
 
 async def schedule_conversation(runtime: RuntimeContext, thread_id: str, run_agent) -> None:
