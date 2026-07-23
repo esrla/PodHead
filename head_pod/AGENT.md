@@ -37,6 +37,21 @@ The body of `SKILL.md` (after the closing `---`) may contain full usage document
 examples, and notes. Reusable scripts should be packaged and documented as skills rather
 than left as bare files in `tools/`.
 
+## Backend Tools
+
+In addition to `run_cli` and `spawn_subagent`, the backend provides the following
+tool directly accessible to the agent without going through the container:
+
+### embed_text
+
+```
+embed_text(text: str) -> {"ok": true, "embedding": [float, ...]}
+```
+
+Returns a normalized semantic embedding vector for `text`. Useful for comparing
+texts by cosine similarity (e.g. `sum(a*b for a, b in zip(vec_a, vec_b))`),
+finding relevant content, or working alongside the skill search script.
+
 ## Finding Skills
 
 Use the skill search script to find the most relevant skill for a task:

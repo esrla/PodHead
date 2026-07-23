@@ -15,10 +15,13 @@ from backhead import db, mail
 from backhead import media as media_mod
 from backhead.agent_loop import Agent, DEFAULT_SYSTEM_PROMPT, messages_to_openai_messages
 from backhead.bootstrap import STATE_DIR
-from backhead.bootstrap import ensure_runtime, open_db_connection
+from backhead.bootstrap import ensure_runtime, open_db_connection, resolve_workspace_host_path
 from backhead.llm import create_openai_client
 from backhead.private_config import CONFIG, AppConfig
+from backhead.skills import embed as skills_embed
+from backhead.skills import generate_skill_header
 from backhead.tools.cli_tool import create_cli_tool
+from backhead.tools.embed_tool import create_embed_tool
 from backhead.tools.spawn_subagent import create_spawn_subagent_tool
 
 MEDIA_ROOT = STATE_DIR
@@ -92,14 +95,32 @@ def build_email_agent_runner(
     max_depth: int,
     max_children: int,
     media_root: Path | None = None,
+    workspace_path: Path | None = None,
 ):
     def run_agent(history: list[dict], current_message: dict) -> str:
         prior = [row for row in history if row["id"] != current_message["id"]]
         prior_messages = messages_to_openai_messages(prior, media_root=media_root)
+
+        augmented_system = system_prompt
+        if workspace_path is not None:
+            message_text = " ".join(
+                part["content"]
+                for part in current_message.get("content", [])
+                if part["content_type"] == "text"
+            ).strip()
+            if message_text:
+                try:
+                    header = generate_skill_header(message_text, workspace_path)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"Skill-header generation failed: {exc}")
+                    header = None
+                if header:
+                    augmented_system = f"{system_prompt}\n\n{header}"
+
         agent = Agent(
             openai_client=openai_client,
             model=model,
-            system_prompt=system_prompt,
+            system_prompt=augmented_system,
             conversation_history=prior_messages,
             tools=tools,
             tool_handlers=tool_handlers,
@@ -143,8 +164,10 @@ def create_tooling(*, config: AppConfig, container_runner):
     sub_client = create_openai_client(config.subagent.base_url, config.subagent.api_key)
 
     cli_schema, cli_handler = create_cli_tool(container_runner)
-    subagent_tools: list[dict] = [cli_schema]
-    subagent_handlers: dict[str, Any] = {"run_cli": cli_handler}
+    embed_schema, embed_handler = create_embed_tool(skills_embed)
+
+    subagent_tools: list[dict] = [cli_schema, embed_schema]
+    subagent_handlers: dict[str, Any] = {"run_cli": cli_handler, "embed_text": embed_handler}
     spawn_schema, spawn_handler = create_spawn_subagent_tool(
         openai_client=sub_client,
         model=config.subagent.model,
@@ -158,8 +181,8 @@ def create_tooling(*, config: AppConfig, container_runner):
     subagent_tools.append(spawn_schema)
     subagent_handlers["spawn_subagent"] = spawn_handler
 
-    main_tools = [cli_schema, spawn_schema]
-    main_handlers = {"run_cli": cli_handler, "spawn_subagent": spawn_handler}
+    main_tools = [cli_schema, spawn_schema, embed_schema]
+    main_handlers = {"run_cli": cli_handler, "spawn_subagent": spawn_handler, "embed_text": embed_handler}
 
     return {
         "main_client": main_client,
@@ -282,6 +305,7 @@ async def run_backend(config: AppConfig = CONFIG) -> None:
         max_depth=config.maximum_agent_depth,
         max_children=config.maximum_children_per_agent,
         media_root=MEDIA_ROOT,
+        workspace_path=resolve_workspace_host_path(config),
     )
 
     while True:
