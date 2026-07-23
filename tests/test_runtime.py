@@ -212,7 +212,7 @@ def test_fatal_request_error_is_replied_with_full_traceback_and_processing_conti
     assert history[3]["content"][0]["content"] == "reply:next"
 
 
-def test_send_request_error_response_smtp_failure_is_logged(monkeypatch, capsys):
+def test_error_response_smtp_failure_is_logged(monkeypatch, capsys):
     conn = _conn()
     queued = _queue_message(conn, "alice@example.com", "<fail@example.com>", "fail", timestamp=1)
     runtime = RuntimeContext(_config(), conn)

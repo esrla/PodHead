@@ -245,7 +245,7 @@ async def _process_conversation(runtime: RuntimeContext, thread_id: str, run_age
                 )
             except Exception:  # noqa: BLE001
                 traceback_text = traceback.format_exc()
-                print(f"Failed to process message {job.message_id} in thread {thread_id}:\n{traceback_text}", end="")
+                print(f"Failed to process message {job.message_id} in thread {thread_id}:\n{traceback_text}")
                 await _send_request_error_response(runtime, job, thread_id, traceback_text)
 
 
