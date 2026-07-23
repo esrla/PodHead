@@ -77,6 +77,7 @@ def create_spawn_subagent_tool(
             depth=calling_agent.depth + 1,
             max_depth=max_depth,
             max_children=max_children,
+            backend_context=calling_agent.backend_context,
         )
         try:
             response = child.run(prompt)

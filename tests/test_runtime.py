@@ -29,6 +29,7 @@ def _config(maximum_concurrent_conversations: int = 2) -> AppConfig:
     return AppConfig(
         main_agent=AgentEndpointConfig(base_url="http://main", api_key="main-key", model="main-model"),
         subagent=AgentEndpointConfig(base_url="http://sub", api_key="sub-key", model="sub-model"),
+        embedding_endpoint=AgentEndpointConfig(base_url="http://embed", api_key="embed-key", model="embed-model"),
         email_account=EmailAccountConfig(address="podhead@example.com", **{"password": "mail-password"}),
         imap=IMAPConfig(
             host="imap.example.com",
@@ -50,7 +51,6 @@ def _config(maximum_concurrent_conversations: int = 2) -> AppConfig:
         maximum_concurrent_conversations=maximum_concurrent_conversations,
         maximum_agent_depth=2,
         maximum_children_per_agent=4,
-        embedding_model="embed-model",
         skill_similarity_threshold=0.35,
         podman_container_name="podhead-agent",
         workspace_path="head_pod",
