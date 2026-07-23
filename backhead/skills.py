@@ -49,7 +49,10 @@ def _delete_sidecar(embed_path: Path) -> None:
 
 
 def _coerce_embedding_vector(value: Any, *, expected_dimensions: int | None = None) -> np.ndarray:
-    vec = np.asarray(value, dtype=np.float32)
+    try:
+        vec = np.asarray(value, dtype=np.float32)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Embedding must be a one-dimensional numeric vector.") from exc
     if vec.ndim != 1:
         raise ValueError("Embedding must be a one-dimensional vector.")
     if vec.size == 0:
@@ -57,7 +60,9 @@ def _coerce_embedding_vector(value: Any, *, expected_dimensions: int | None = No
     if not np.isfinite(vec).all():
         raise ValueError("Embedding must contain only finite values.")
     if expected_dimensions is not None and vec.shape[0] != expected_dimensions:
-        raise ValueError("Embedding dimensions are incompatible.")
+        raise ValueError(
+            f"Embedding dimensions are incompatible: expected {expected_dimensions}, got {vec.shape[0]}."
+        )
     return vec
 
 

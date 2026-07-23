@@ -60,7 +60,9 @@ def validate_config(config: AppConfig) -> None:
     if not config.embedding_model.strip():
         raise ValueError("embedding_model must not be empty.")
     if not 0.0 <= config.skill_similarity_threshold <= 1.0:
-        raise ValueError("skill_similarity_threshold must be between 0.0 and 1.0.")
+        raise ValueError(
+            f"skill_similarity_threshold must be between 0.0 and 1.0, got {config.skill_similarity_threshold}."
+        )
 
 
 def resolve_workspace_host_path(config: AppConfig) -> Path:

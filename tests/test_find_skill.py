@@ -69,7 +69,7 @@ class TestSearch:
 
     def test_plain_query_text_is_not_accepted(self, tmp_path):
         _write_skill(tmp_path / "calc", "Calculator", "Performs arithmetic.")
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="one-dimensional numeric vector"):
             search("arithmetic", find_skills(tmp_path), min_similarity=0.0)
 
     def test_missing_sidecar_is_not_generated_by_container(self, tmp_path):
