@@ -26,6 +26,7 @@ IMAGE_BUILD_INPUTS = (
     CONTAINERFILE_PATH,
     REPO_ROOT / "container-requirements.txt",
 )
+STARTED_MODEL_SERVER_PROCESSES: list[subprocess.Popen] = []
 MODEL_SERVER_STARTUP_TIMEOUT_SECONDS = 15.0
 MODEL_SERVER_STARTUP_POLL_INTERVAL_SECONDS = 0.25
 
@@ -240,7 +241,7 @@ def _endpoint_health_url(endpoint: AgentEndpointConfig) -> str:
 def _is_endpoint_healthy(endpoint: AgentEndpointConfig) -> bool:
     try:
         with urllib_request.urlopen(_endpoint_health_url(endpoint), timeout=2.0) as response:
-            return 200 <= getattr(response, "status", 0) < 300
+            return 200 <= getattr(response, "code", 0) < 300
     except (urllib_error.URLError, TimeoutError, ValueError):
         return False
 
@@ -297,7 +298,13 @@ def _build_model_server_command(endpoint: AgentEndpointConfig, *, label: str) ->
 
 def _start_model_server(endpoint: AgentEndpointConfig, *, label: str) -> None:
     command = _build_model_server_command(endpoint, label=label)
-    subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    STARTED_MODEL_SERVER_PROCESSES.append(process)
 
 
 def _wait_for_endpoint(endpoint: AgentEndpointConfig, *, label: str) -> None:
