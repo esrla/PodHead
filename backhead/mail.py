@@ -498,8 +498,9 @@ def poll_inbox(
                     try:
                         _move_to_mailbox(client, uid, spam_mailbox)
                     except Exception:  # noqa: BLE001
-                        print(f"#mail quarantine-failed sender={sender}", flush=True)
-                        client.uid("STORE", uid, "+FLAGS.SILENT", r"(\Seen)")
+                        print(f"#mail quarantine-failed sender={sender or 'unknown'}", flush=True)
+                        with contextlib.suppress(Exception):
+                            client.uid("STORE", uid, "+FLAGS.SILENT", r"(\Seen)")
                     results.append({"status": "moved_to_spam", "sender": sender})
                     continue
 
