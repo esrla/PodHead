@@ -318,16 +318,18 @@ def _wait_for_endpoint(endpoint: AgentEndpointConfig, *, label: str) -> None:
 
 def ensure_model_servers(config: AppConfig) -> None:
     managed_endpoints = (
-        ("Main model server", config.main_agent),
-        ("Embedding model server", config.embedding_endpoint),
+        ("Main model server", "main", config.main_agent),
+        ("Embedding model server", "embedding", config.embedding_endpoint),
     )
-    for label, endpoint in managed_endpoints:
+    for label, tag, endpoint in managed_endpoints:
         if not endpoint.manages_local_process:
             continue
         if _is_endpoint_healthy(endpoint):
             continue
+        print(f"#model {tag} starting", flush=True)
         _start_model_server(endpoint, label=label)
         _wait_for_endpoint(endpoint, label=label)
+        print(f"#model {tag} ready", flush=True)
 
 
 def verify_container_environment(config: AppConfig, *, expected_image_id: str | None = None) -> None:
@@ -361,12 +363,15 @@ def initialize_database() -> None:
 
 
 def ensure_runtime(config: AppConfig = CONFIG) -> None:
+    print("#bootstrap validate", flush=True)
     validate_config(config)
     ensure_podman_available()
     ensure_state_dir()
+    print("#bootstrap models", flush=True)
     ensure_model_servers(config)
     workspace_host_path = resolve_workspace_host_path(config)
     workspace_host_path.mkdir(parents=True, exist_ok=True)
+    print("#bootstrap container", flush=True)
     image_id, _ = ensure_container_image()
 
     if _podman_exists("container", config.podman_container_name):
@@ -382,4 +387,6 @@ def ensure_runtime(config: AppConfig = CONFIG) -> None:
         _start_container(config.podman_container_name)
 
     verify_container_environment(config, expected_image_id=image_id)
+    print("#bootstrap database", flush=True)
     initialize_database()
+    print("#bootstrap ready", flush=True)
