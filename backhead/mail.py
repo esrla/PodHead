@@ -497,6 +497,7 @@ def poll_inbox(
                 if not sender or sender not in normalized_whitelist:
                     try:
                         _move_to_mailbox(client, uid, spam_mailbox)
+                        print(f"#mail rejected sender={sender or 'unknown'}", flush=True)
                     except Exception:  # noqa: BLE001
                         print(f"#mail quarantine-failed sender={sender or 'unknown'}", flush=True)
                         with contextlib.suppress(Exception):
@@ -558,6 +559,7 @@ def poll_inbox(
                     "message_id": message_row_id,
                     "transport": transport,
                 })
+                print(f"#mail queued sender={sender}", flush=True)
             return results
     except IMAPPollError:
         raise
