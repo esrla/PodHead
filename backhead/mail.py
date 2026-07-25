@@ -444,16 +444,21 @@ def _fetch_uid_bytes(client, uid: bytes, fetch_spec: str) -> bytes | None:
 
 
 def _move_to_mailbox(client, uid: bytes, mailbox: str) -> None:
-    status, _ = client.uid("MOVE", uid, mailbox)
-    if status == "OK":
-        return
+    try:
+        status, _ = client.uid("MOVE", uid, mailbox)
+        if status == "OK":
+            return
+    except imaplib.IMAP4.error:
+        pass
     status, _ = client.uid("COPY", uid, mailbox)
     if status != "OK":
-        raise IMAPPollError(f"Failed to move message to mailbox {mailbox!r}")
-    status, _ = client.uid("STORE", uid, "+FLAGS.SILENT", r"(\\Deleted)")
+        raise IMAPPollError(f"Failed to copy message to mailbox {mailbox!r}")
+    status, _ = client.uid("STORE", uid, "+FLAGS.SILENT", r"(\Deleted)")
     if status != "OK":
         raise IMAPPollError("Failed to mark source message deleted after copy fallback")
-    client.expunge()
+    status, _ = client.expunge()
+    if status != "OK":
+        raise IMAPPollError("Failed to expunge source message after copy fallback")
 
 
 def _sender_from_header_bytes(header_bytes: bytes) -> str | None:
@@ -490,7 +495,13 @@ def poll_inbox(
                     continue
                 sender = _sender_from_header_bytes(header_bytes)
                 if not sender or sender not in normalized_whitelist:
-                    _move_to_mailbox(client, uid, spam_mailbox)
+                    try:
+                        _move_to_mailbox(client, uid, spam_mailbox)
+                        print(f"#mail rejected sender={sender or 'unknown'}", flush=True)
+                    except Exception:  # noqa: BLE001
+                        print(f"#mail quarantine-failed sender={sender or 'unknown'}", flush=True)
+                        with contextlib.suppress(Exception):
+                            client.uid("STORE", uid, "+FLAGS.SILENT", r"(\Seen)")
                     results.append({"status": "moved_to_spam", "sender": sender})
                     continue
 
@@ -498,6 +509,7 @@ def poll_inbox(
                 if not isinstance(payload, (bytes, bytearray)):
                     continue
                 incoming = parse_mime_message(bytes(payload))
+                print(f"#mail received sender={sender}", flush=True)
 
                 # Prepare all data outside the lock
                 incoming_message_id = normalize_message_id(incoming.message_id)
@@ -528,7 +540,7 @@ def poll_inbox(
                     )
 
                 # Mark as Seen only after successful storage
-                client.uid("STORE", uid, "+FLAGS.SILENT", r"(\\Seen)")
+                client.uid("STORE", uid, "+FLAGS.SILENT", r"(\Seen)")
 
                 transport = EmailTransportData(
                     imap_identifier=uid_str,
@@ -547,6 +559,7 @@ def poll_inbox(
                     "message_id": message_row_id,
                     "transport": transport,
                 })
+                print(f"#mail queued sender={sender}", flush=True)
             return results
     except IMAPPollError:
         raise

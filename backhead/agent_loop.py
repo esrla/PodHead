@@ -312,6 +312,7 @@ class Agent:
                 final_reply = msg.content or ""
                 self._final_reply = final_reply
                 if self.depth == 0:
+                    print("#agent reply", flush=True)
                     tree = build_execution_tree(self, final_reply)
                     if tree:
                         return f"{tree}\n---\n{final_reply}"
@@ -343,6 +344,7 @@ class Agent:
                     continue
 
                 try:
+                    print(f"#agent tool tool={tool_name}", flush=True)
                     result = handler(args, self)
                 except TimeoutError as exc:
                     result = tool_error_result(

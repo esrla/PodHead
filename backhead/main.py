@@ -442,6 +442,7 @@ async def run_backend(config: AppConfig = CONFIG) -> None:
         history_builder=history_builder,
     )
 
+    print("#runtime polling", flush=True)
     while True:
         await poll_and_schedule(runtime, run_agent)
         await asyncio.sleep(config.mail_polling_interval_seconds)
