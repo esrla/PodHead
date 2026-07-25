@@ -12,7 +12,7 @@ PODHEAD ARCHITECTURE — single-file spec
 - Communicate via triggers from one or more sources (initially: email).
 - Keep long conversations coherent using the full stored conversation log.
 - Run the agent's system-access (CLI/scripts) inside a container isolated from backend files.
-- Keep secrets and sensitive identity data (API keys, IMAP/SMTP creds, endpoints, whitelist, etc.) out of Git by placing them in backhead/private_config.py with placeholder values only.
+- Keep secrets and sensitive identity data (API keys, IMAP/SMTP credentials, endpoints, whitelist, etc.) out of Git by placing them in backhead/secrets.py.
 - Repo contains backend code and agent workspace, but no sensitive data.
 
 
@@ -28,7 +28,7 @@ PODHEAD ARCHITECTURE — single-file spec
   - persistent conversation compaction side data
   - attachment handling (decode/normalize images)
   - agent CLI runner (run_cli in container)
-  - config loader (backhead/private_config.py)
+  - local configuration values (backhead/secrets.py, created from backhead/secrets.example.py)
 - head_pod workspace provides:
   - AGENT.md
   - preferences.md
@@ -85,7 +85,7 @@ Notes:
 
 
 6) Whitelist
-- The whitelist is a list of normalized sender email addresses in backhead/private_config.py.
+- The whitelist is a list of normalized sender email addresses in backhead/secrets.py.
 - Whitelist validation happens before full MIME parsing.
 - Rejected senders are moved to the configured spam mailbox.
 
@@ -227,10 +227,11 @@ Backend-owned runtime state (not committed):
   - agent.db (and WAL files)
   - media/
 
-Private config (committed with placeholder values only):
-- backhead/private_config.py contains Python configuration classes.
-- Users replace placeholder values locally and must not commit real secrets.
-- Configurable values include: main agent endpoint, subagent endpoint, email account, IMAP, SMTP, sender whitelist, limits, Podman container name, workspace path, spam mailbox.
+Private configuration:
+- backhead/secrets.example.py contains the complete example configuration and is committed to Git.
+- Users copy it to backhead/secrets.py and replace the demonstration values locally.
+- backhead/secrets.py is excluded by .gitignore and must not be committed.
+- Configurable values include: main agent endpoint, subagent endpoint, embedding endpoint, email account, IMAP, SMTP, sender whitelist, limits, Podman container name, workspace path, and spam mailbox.
 
 Agent workspace (committed):
 - head_pod/

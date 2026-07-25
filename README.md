@@ -16,8 +16,8 @@ Backend startup bootstraps the runtime automatically before entering the normal 
 
 ## Configuration
 
-Edit `/home/runner/work/PodHead/PodHead/backhead/private_config.py` before running PodHead.
-The committed values are demonstrations only. Replace them with your own values and do not commit real secrets.
+Copy `backhead/secrets.example.py` to `backhead/secrets.py` before running PodHead.
+Replace every demonstration value in `backhead/secrets.py`. The local secrets file is excluded by `.gitignore` and must not be committed.
 
 The configuration defines:
 
@@ -69,7 +69,7 @@ The backend verifies that:
 - the configured container exists
 - the container is running
 - `head_pod` is mounted to `/workspace`
-- backend code and `backhead/private_config.py` are not mounted into the container
+- backend code and `backhead/secrets.py` are not mounted into the container
 - `/workspace/AGENT.md` exists inside the container
 
 ## Installation

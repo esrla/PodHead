@@ -20,7 +20,7 @@ from backhead.bootstrap import STATE_DIR
 from backhead.bootstrap import ensure_runtime, open_db_connection, resolve_workspace_host_path
 from backhead.embeddings import create_document_embed_fn, create_query_embed_fn
 from backhead.llm import create_openai_client
-from backhead.private_config import CONFIG, AppConfig
+from backhead import secrets
 from backhead.skills import generate_skill_header
 from backhead.tools.cli_tool import create_cli_tool
 from backhead.tools.embed_tool import create_embed_tool
@@ -42,7 +42,7 @@ class QueuedEmailJob:
 
 
 class RuntimeContext:
-    def __init__(self, config: AppConfig, conn: sqlite3.Connection) -> None:
+    def __init__(self, config, conn: sqlite3.Connection) -> None:
         self.config = config
         self.conn = conn
         self.db_lock = threading.Lock()
@@ -50,7 +50,7 @@ class RuntimeContext:
         self.processing_tasks_lock = asyncio.Lock()
         self.queue_lock = asyncio.Lock()
         self.thread_queues: dict[str, deque[QueuedEmailJob]] = defaultdict(deque)
-        self.semaphore = asyncio.Semaphore(config.maximum_concurrent_conversations)
+        self.semaphore = asyncio.Semaphore(config.MAXIMUM_CONCURRENT_CONVERSATIONS)
         self.document_embed_fn: Callable[[list[str]], Any] | None = None
         self.query_embed_fn: Callable[[list[str]], Any] | None = None
 
@@ -161,12 +161,12 @@ def create_podman_runner(container_name: str, timeout_seconds: int = 300):
     return run_in_container
 
 
-def create_tooling(*, config: AppConfig, container_runner, runtime: RuntimeContext | None = None):
-    main_client = create_openai_client(config.main_agent.base_url, config.main_agent.api_key)
-    sub_client = create_openai_client(config.subagent.base_url, config.subagent.api_key)
-    embedding_client = create_openai_client(config.embedding_endpoint.base_url, config.embedding_endpoint.api_key)
-    document_embed_fn = create_document_embed_fn(embedding_client, config.embedding_endpoint.model)
-    query_embed_fn = create_query_embed_fn(embedding_client, config.embedding_endpoint.model)
+def create_tooling(*, config, container_runner, runtime: RuntimeContext | None = None):
+    main_client = create_openai_client(config.MAIN_AGENT["base_url"], config.MAIN_AGENT["api_key"])
+    sub_client = create_openai_client(config.SUBAGENT["base_url"], config.SUBAGENT["api_key"])
+    embedding_client = create_openai_client(config.EMBEDDING_ENDPOINT["base_url"], config.EMBEDDING_ENDPOINT["api_key"])
+    document_embed_fn = create_document_embed_fn(embedding_client, config.EMBEDDING_ENDPOINT["model"])
+    query_embed_fn = create_query_embed_fn(embedding_client, config.EMBEDDING_ENDPOINT["model"])
 
     cli_schema, cli_handler = create_cli_tool(container_runner)
     embed_schema, embed_handler = create_embed_tool(document_embed_fn)
@@ -176,7 +176,7 @@ def create_tooling(*, config: AppConfig, container_runner, runtime: RuntimeConte
             return generate_skill_header(
                 prompt_text,
                 workspace_path,
-                min_similarity=config.skill_similarity_threshold,
+                min_similarity=config.SKILL_SIMILARITY_THRESHOLD,
                 query_embed_fn=query_embed_fn,
                 document_embed_fn=document_embed_fn,
             )
@@ -195,7 +195,7 @@ def create_tooling(*, config: AppConfig, container_runner, runtime: RuntimeConte
             query=query,
             query_embed_fn=query_embed_fn,
             document_embed_fn=document_embed_fn,
-            embedding_model=config.embedding_endpoint.model,
+            embedding_model=config.EMBEDDING_ENDPOINT["model"],
             limit=max_results,
         )
 
@@ -209,15 +209,15 @@ def create_tooling(*, config: AppConfig, container_runner, runtime: RuntimeConte
     }
     spawn_schema, spawn_handler = create_spawn_subagent_tool(
         openai_client=sub_client,
-        model=config.subagent.model,
+        model=config.SUBAGENT["model"],
         system_prompt=DEFAULT_SYSTEM_PROMPT,
         workspace_path=resolve_workspace_host_path(config),
         skill_header_provider=skill_header_provider,
         tools=subagent_tools,
         tool_handlers=subagent_handlers,
         container_runner=container_runner,
-        max_depth=config.maximum_agent_depth,
-        max_children=config.maximum_children_per_agent,
+        max_depth=config.MAXIMUM_AGENT_DEPTH,
+        max_children=config.MAXIMUM_CHILDREN_PER_AGENT,
     )
     subagent_tools.append(spawn_schema)
     subagent_handlers["spawn_subagent"] = spawn_handler
@@ -251,7 +251,7 @@ def _refresh_message_embeddings(runtime: RuntimeContext, sender_id: str) -> None
         db_lock=runtime.db_lock,
         sender_id=sender_id,
         document_embed_fn=runtime.document_embed_fn,
-        embedding_model=runtime.config.embedding_endpoint.model,
+        embedding_model=runtime.config.EMBEDDING_ENDPOINT["model"],
     )
 
 
@@ -279,7 +279,7 @@ async def _process_conversation(runtime: RuntimeContext, thread_id: str, run_age
                 await asyncio.to_thread(_refresh_message_embeddings, runtime, current_message["sender_id"])
                 reply_text = await asyncio.to_thread(run_agent, history, current_message)
                 outgoing, _ = mail.build_reply_email(
-                    from_address=runtime.config.email_account.address,
+                    from_address=runtime.config.EMAIL_ACCOUNT["address"],
                     to=job.transport.sender_id,
                     subject=job.transport.subject,
                     body=reply_text,
@@ -287,7 +287,7 @@ async def _process_conversation(runtime: RuntimeContext, thread_id: str, run_age
                     incoming_message_id=job.transport.incoming_message_id,
                     references_header=job.transport.references,
                 )
-                await asyncio.to_thread(mail.send_reply_smtp, outgoing, runtime.config.smtp)
+                await asyncio.to_thread(mail.send_reply_smtp, outgoing, runtime.config.SMTP)
                 ts = db.now_local_iso()
                 await asyncio.to_thread(
                     _db_call,
@@ -315,7 +315,7 @@ async def _send_request_error_response(
 ) -> None:
     try:
         outgoing, _ = mail.build_reply_email(
-            from_address=runtime.config.email_account.address,
+            from_address=runtime.config.EMAIL_ACCOUNT["address"],
             to=job.transport.sender_id,
             subject=job.transport.subject,
             body=traceback_text,
@@ -323,7 +323,7 @@ async def _send_request_error_response(
             incoming_message_id=job.transport.incoming_message_id,
             references_header=job.transport.references,
         )
-        await asyncio.to_thread(mail.send_reply_smtp, outgoing, runtime.config.smtp)
+        await asyncio.to_thread(mail.send_reply_smtp, outgoing, runtime.config.SMTP)
     except Exception as exc:  # noqa: BLE001
         LOGGER.error(
             "Failed to send email request error response for message %s in thread %s: %r",
@@ -373,9 +373,9 @@ async def schedule_conversation(runtime: RuntimeContext, thread_id: str, run_age
 def _poll_inbox(runtime: RuntimeContext) -> list[dict]:
     return mail.poll_inbox(
         conn=runtime.conn,
-        whitelist=runtime.config.sender_whitelist,
-        imap_config=runtime.config.imap,
-        spam_mailbox=runtime.config.spam_mailbox,
+        whitelist=runtime.config.SENDER_WHITELIST,
+        imap_config=runtime.config.IMAP,
+        spam_mailbox=runtime.config.SPAM_MAILBOX,
         media_root=MEDIA_ROOT,
         db_lock=runtime.db_lock,
     )
@@ -404,10 +404,10 @@ async def poll_and_schedule(runtime: RuntimeContext, run_agent) -> None:
         await schedule_conversation(runtime, thread_id, run_agent)
 
 
-async def run_backend(config: AppConfig = CONFIG) -> None:
+async def run_backend(config=secrets) -> None:
     conn = open_db_connection()
     runtime = RuntimeContext(config, conn)
-    container_runner = create_podman_runner(config.podman_container_name)
+    container_runner = create_podman_runner(config.PODMAN_CONTAINER_NAME)
     tooling = create_tooling(config=config, container_runner=container_runner, runtime=runtime)
     runtime.document_embed_fn = tooling["document_embed_fn"]
     runtime.query_embed_fn = tooling["query_embed_fn"]
@@ -429,13 +429,13 @@ async def run_backend(config: AppConfig = CONFIG) -> None:
 
     run_agent = build_email_agent_runner(
         openai_client=tooling["main_client"],
-        model=config.main_agent.model,
+        model=config.MAIN_AGENT["model"],
         system_prompt=DEFAULT_SYSTEM_PROMPT,
         tools=tooling["main_tools"],
         tool_handlers=tooling["main_handlers"],
         container_runner=container_runner,
-        max_depth=config.maximum_agent_depth,
-        max_children=config.maximum_children_per_agent,
+        max_depth=config.MAXIMUM_AGENT_DEPTH,
+        max_children=config.MAXIMUM_CHILDREN_PER_AGENT,
         media_root=MEDIA_ROOT,
         workspace_path=resolve_workspace_host_path(config),
         skill_header_provider=tooling["skill_header_provider"],
@@ -445,12 +445,12 @@ async def run_backend(config: AppConfig = CONFIG) -> None:
     print("#runtime polling", flush=True)
     while True:
         await poll_and_schedule(runtime, run_agent)
-        await asyncio.sleep(config.mail_polling_interval_seconds)
+        await asyncio.sleep(config.MAIL_POLLING_INTERVAL_SECONDS)
 
 
 def main() -> None:
-    ensure_runtime(CONFIG)
-    asyncio.run(run_backend(CONFIG))
+    ensure_runtime(secrets)
+    asyncio.run(run_backend(secrets))
 
 
 if __name__ == "__main__":
