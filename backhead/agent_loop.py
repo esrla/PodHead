@@ -274,7 +274,11 @@ class Agent:
         return self._run_loop()
 
     def _run_loop(self) -> str:
+        agent_name = "main agent" if self.depth == 0 else f"{'sub-' * self.depth}agent"
+
         while True:
+            print(f"#{agent_name} calling", flush=True)
+
             kwargs: dict[str, Any] = {
                 "model": self.model,
                 "messages": [
@@ -311,11 +315,13 @@ class Agent:
             if not msg.tool_calls:
                 final_reply = msg.content or ""
                 self._final_reply = final_reply
+                print(f"#{agent_name} final answer", flush=True)
+
                 if self.depth == 0:
-                    print("#agent reply", flush=True)
                     tree = build_execution_tree(self, final_reply)
                     if tree:
                         return f"{tree}\n---\n{final_reply}"
+
                 return final_reply
 
             for tc in msg.tool_calls:
@@ -344,7 +350,10 @@ class Agent:
                     continue
 
                 try:
-                    print(f"#agent tool tool={tool_name}", flush=True)
+                    print(
+                        f"#{agent_name} calling tool {tool_name}",
+                        flush=True,
+                    )
                     result = handler(args, self)
                 except TimeoutError as exc:
                     result = tool_error_result(
@@ -359,6 +368,12 @@ class Agent:
                         "Tool execution failed.",
                         str(exc),
                     )
+
+                preview = _format_result_preview(result).replace("\n", " ")[:10]
+                print(
+                    f"#tool result from {tool_name} {preview!r}",
+                    flush=True,
+                )
 
                 child_agent = self._pending_child_agent
                 self._pending_child_agent = None

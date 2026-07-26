@@ -131,6 +131,12 @@ def build_email_agent_runner(
                 "thread_id": current_message.get("thread_id"),
             },
         )
+        sender_id = current_message.get("sender_id") or "unknown"
+        print(
+            f"#message received from {sender_id}, calling main agent",
+            flush=True,
+        )
+
         prompt = _current_message_prompt(current_message, media_root)
         return agent.run(prompt)
 
