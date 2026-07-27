@@ -294,10 +294,18 @@ class Agent:
             choice = response.choices[0]
             msg = choice.message
 
+            message_data = msg.model_dump(exclude_none=False)
+            reasoning = message_data.get("reasoning_content") or ""
+            content = msg.content or ""
+
             assistant_turn: dict[str, Any] = {
                 "role": "assistant",
                 "content": msg.content,
             }
+
+            if reasoning:
+                assistant_turn["reasoning_content"] = reasoning
+
             if msg.tool_calls:
                 assistant_turn["tool_calls"] = [
                     {
@@ -310,10 +318,76 @@ class Agent:
                     }
                     for tc in msg.tool_calls
                 ]
-            self.conversation_history.append(assistant_turn)
+                self.conversation_history.append(assistant_turn)
+            else:
+                final_reply = "\n\n".join(
+                    part.strip()
+                    for part in (reasoning, content)
+                    if part.strip()
+                )
 
-            if not msg.tool_calls:
-                final_reply = msg.content or ""
+                if not final_reply:
+                    print(
+                        f"#{agent_name} returned empty response; "
+                        "retrying once without tools",
+                        flush=True,
+                    )
+
+                    fallback = self.openai_client.chat.completions.create(
+                        model=self.model,
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": self.system_prompt,
+                            },
+                            *self.conversation_history,
+                            {
+                                "role": "system",
+                                "content": (
+                                    "The previous response contained neither "
+                                    "reasoning nor content. Using the full "
+                                    "conversation and all tool results above, "
+                                    "provide the best possible final response "
+                                    "now. Tools are unavailable."
+                                ),
+                            },
+                        ],
+                    )
+
+                    fallback_message = fallback.choices[0].message
+                    fallback_data = fallback_message.model_dump(
+                        exclude_none=False
+                    )
+                    fallback_reasoning = (
+                        fallback_data.get("reasoning_content") or ""
+                    )
+                    fallback_content = fallback_message.content or ""
+
+                    final_reply = "\n\n".join(
+                        part.strip()
+                        for part in (
+                            fallback_reasoning,
+                            fallback_content,
+                        )
+                        if part.strip()
+                    )
+
+                    assistant_turn = {
+                        "role": "assistant",
+                        "content": fallback_message.content,
+                    }
+
+                    if fallback_reasoning:
+                        assistant_turn["reasoning_content"] = (
+                            fallback_reasoning
+                        )
+
+                    if not final_reply:
+                        final_reply = "Agent responded empty string"
+                        assistant_turn["content"] = final_reply
+                        print(final_reply, flush=True)
+
+                self.conversation_history.append(assistant_turn)
                 self._final_reply = final_reply
                 print(f"#{agent_name} final answer", flush=True)
 

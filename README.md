@@ -101,3 +101,28 @@ Run the test suite from the repository root with:
 ```bash
 python -m pytest -q
 ```
+
+## Admin dashboard
+
+PodHead includes a read-only Streamlit dashboard for inspecting backend activity.
+
+The dashboard shows:
+
+- backend and database status
+- recent activity
+- conversations and stored message content
+- conversation compaction summaries
+- embedding coverage
+- the PodHead log
+
+Start PodHead and the dashboard together by running:
+
+    ./startup.sh
+
+Streamlit listens only on `127.0.0.1:8501` and is not exposed directly to the local network. When Tailscale is installed and connected, `startup.sh` exposes the dashboard through Tailscale Serve.
+
+Use the HTTPS address printed by `tailscale serve status` to open the dashboard from another device in the same tailnet.
+
+The dashboard reads the SQLite database in read-only mode and does not expose `backhead/secrets.py`.
+
+Streamlit output is written to `~/podhead-web.log`. The PodHead backend continues to write to `~/podhead.log`.

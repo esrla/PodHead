@@ -2,3 +2,4 @@ openai
 numpy
 PyYAML
 pytest
+streamlit
