@@ -8,7 +8,7 @@
 8. Keep `backhead/secrets.py` local. It is excluded by `.gitignore` and must never be committed.
 9. Configure the local llama.cpp chat server and dedicated embedding server paths, models, hosts, ports, context sizes, and threads in `backhead/secrets.py`.
 10. Configure the email account, IMAP, SMTP, sender whitelist, and spam mailbox in `backhead/secrets.py`.
-11. Start the backend with `python -m backhead.main`; PodHead will health-check both configured model endpoints and start missing local servers automatically.
+11. Start the backend with `python -m backhead.main`; PodHead will health-check both configured model endpoints and start missing local servers automatically. Optionally, run `./startup.sh` to start PodHead in the background, write output to `~/podhead.log`, and avoid starting a second instance if one is already running.
 12. Send a test email from a whitelisted address.
 13. Build or refresh the Podman image through normal backend startup; it installs `container-requirements.txt` inside the container image.
 14. Verify the reply, database, and container.

@@ -276,14 +276,53 @@ async def _process_conversation(runtime: RuntimeContext, thread_id: str, run_age
             if job is None:
                 return
 
-            history = await asyncio.to_thread(_db_call, runtime, db.get_conversation, "email", thread_id)
-            current_message = next((m for m in history if m["id"] == job.message_id), None)
+            print(
+                f"#request start thread={thread_id} message={job.message_id}",
+                flush=True,
+            )
+
+            history = await asyncio.to_thread(
+                _db_call,
+                runtime,
+                db.get_conversation,
+                "email",
+                thread_id,
+            )
+            current_message = next(
+                (message for message in history if message["id"] == job.message_id),
+                None,
+            )
             if current_message is None:
+                print(
+                    f"#request ignored reason=message-not-found thread={thread_id}",
+                    flush=True,
+                )
                 continue
 
+            stage = "refresh-input-embeddings"
+
             try:
-                await asyncio.to_thread(_refresh_message_embeddings, runtime, current_message["sender_id"])
-                reply_text = await asyncio.to_thread(run_agent, history, current_message)
+                print(f"#request stage={stage}", flush=True)
+                await asyncio.to_thread(
+                    _refresh_message_embeddings,
+                    runtime,
+                    current_message["sender_id"],
+                )
+
+                stage = "agent"
+                print(f"#request stage={stage}", flush=True)
+                reply_text = await asyncio.to_thread(
+                    run_agent,
+                    history,
+                    current_message,
+                )
+                print(
+                    f"#reply generated characters={len(reply_text)}",
+                    flush=True,
+                )
+
+                stage = "build-email"
+                print(f"#request stage={stage}", flush=True)
                 outgoing, _ = mail.build_reply_email(
                     from_address=runtime.config.EMAIL_ACCOUNT["address"],
                     to=job.transport.sender_id,
@@ -293,8 +332,26 @@ async def _process_conversation(runtime: RuntimeContext, thread_id: str, run_age
                     incoming_message_id=job.transport.incoming_message_id,
                     references_header=job.transport.references,
                 )
-                await asyncio.to_thread(mail.send_reply_smtp, outgoing, runtime.config.SMTP)
-                ts = db.now_local_iso()
+                print(
+                    f"#email built recipient={job.transport.sender_id}",
+                    flush=True,
+                )
+
+                stage = "smtp-send"
+                print(
+                    f"#smtp sending host={runtime.config.SMTP['host']} "
+                    f"port={runtime.config.SMTP['port']}",
+                    flush=True,
+                )
+                await asyncio.to_thread(
+                    mail.send_reply_smtp,
+                    outgoing,
+                    runtime.config.SMTP,
+                )
+                print("#smtp sent", flush=True)
+
+                stage = "store-reply"
+                print(f"#request stage={stage}", flush=True)
                 await asyncio.to_thread(
                     _db_call,
                     runtime,
@@ -303,14 +360,41 @@ async def _process_conversation(runtime: RuntimeContext, thread_id: str, run_age
                     thread_id=thread_id,
                     sender_id=job.transport.sender_id,
                     role="assistant",
-                    timestamp=ts,
+                    timestamp=db.now_local_iso(),
                     content_parts=[("text", reply_text)],
                 )
-                await asyncio.to_thread(_refresh_message_embeddings, runtime, job.transport.sender_id)
-            except Exception:  # noqa: BLE001
+                print("#reply stored", flush=True)
+
+                stage = "refresh-reply-embeddings"
+                print(f"#request stage={stage}", flush=True)
+                await asyncio.to_thread(
+                    _refresh_message_embeddings,
+                    runtime,
+                    job.transport.sender_id,
+                )
+
+                print(
+                    f"#request complete thread={thread_id} message={job.message_id}",
+                    flush=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"#request failed stage={stage} "
+                    f"error={type(exc).__name__}: {exc}",
+                    flush=True,
+                )
                 traceback_text = traceback.format_exc()
-                LOGGER.exception("Failed to process message %s in thread %s", job.message_id, thread_id)
-                await _send_request_error_response(runtime, job, thread_id, traceback_text)
+                LOGGER.exception(
+                    "Failed to process message %s in thread %s",
+                    job.message_id,
+                    thread_id,
+                )
+                await _send_request_error_response(
+                    runtime,
+                    job,
+                    thread_id,
+                    traceback_text,
+                )
 
 
 async def _send_request_error_response(
@@ -320,6 +404,7 @@ async def _send_request_error_response(
     traceback_text: str,
 ) -> None:
     try:
+        print("#error-reply building", flush=True)
         outgoing, _ = mail.build_reply_email(
             from_address=runtime.config.EMAIL_ACCOUNT["address"],
             to=job.transport.sender_id,
@@ -329,8 +414,23 @@ async def _send_request_error_response(
             incoming_message_id=job.transport.incoming_message_id,
             references_header=job.transport.references,
         )
-        await asyncio.to_thread(mail.send_reply_smtp, outgoing, runtime.config.SMTP)
+
+        print(
+            f"#error-reply sending host={runtime.config.SMTP['host']} "
+            f"port={runtime.config.SMTP['port']}",
+            flush=True,
+        )
+        await asyncio.to_thread(
+            mail.send_reply_smtp,
+            outgoing,
+            runtime.config.SMTP,
+        )
+        print("#error-reply sent", flush=True)
     except Exception as exc:  # noqa: BLE001
+        print(
+            f"#error-reply failed error={type(exc).__name__}: {exc}",
+            flush=True,
+        )
         LOGGER.error(
             "Failed to send email request error response for message %s in thread %s: %r",
             job.message_id,
@@ -340,7 +440,7 @@ async def _send_request_error_response(
         return
 
     try:
-        ts = db.now_local_iso()
+        print("#error-reply storing", flush=True)
         await asyncio.to_thread(
             _db_call,
             runtime,
@@ -349,11 +449,20 @@ async def _send_request_error_response(
             thread_id=thread_id,
             sender_id=job.transport.sender_id,
             role="assistant",
-            timestamp=ts,
+            timestamp=db.now_local_iso(),
             content_parts=[("text", traceback_text)],
         )
-        await asyncio.to_thread(_refresh_message_embeddings, runtime, job.transport.sender_id)
+        await asyncio.to_thread(
+            _refresh_message_embeddings,
+            runtime,
+            job.transport.sender_id,
+        )
+        print("#error-reply stored", flush=True)
     except Exception as exc:  # noqa: BLE001
+        print(
+            f"#error-reply store-failed error={type(exc).__name__}: {exc}",
+            flush=True,
+        )
         LOGGER.error(
             "Failed to persist request error response for message %s in thread %s: %r",
             job.message_id,

@@ -412,19 +412,19 @@ def send_reply_smtp(outgoing: OutgoingEmail, smtp_config: SMTPConfigProtocol) ->
     message.set_content(outgoing.body)
 
     try:
-        with smtplib.SMTP(smtp_config.host, smtp_config.port, timeout=30) as smtp:
-            if smtp_config.use_tls:
+        with smtplib.SMTP(smtp_config["host"], smtp_config["port"], timeout=30) as smtp:
+            if smtp_config["use_tls"]:
                 smtp.starttls()
-            smtp.login(smtp_config.username, smtp_config.password)
+            smtp.login(smtp_config["username"], smtp_config["password"])
             smtp.send_message(message)
     except Exception as exc:  # noqa: BLE001
         raise SMTPDeliveryError(str(exc)) from exc
 
 
 def _open_imap_connection(imap_config: IMAPConfigProtocol):
-    if imap_config.use_ssl:
-        return imaplib.IMAP4_SSL(imap_config.host, imap_config.port)
-    return imaplib.IMAP4(imap_config.host, imap_config.port)
+    if imap_config["use_ssl"]:
+        return imaplib.IMAP4_SSL(imap_config["host"], imap_config["port"])
+    return imaplib.IMAP4(imap_config["host"], imap_config["port"])
 
 
 def _extract_response_bytes(response) -> bytes | None:
@@ -479,10 +479,10 @@ def poll_inbox(
     normalized_whitelist = {s.strip().lower() for s in whitelist}
     try:
         with _open_imap_connection(imap_config) as client:
-            client.login(imap_config.username, imap_config.password)
-            status, _ = client.select(imap_config.inbox)
+            client.login(imap_config["username"], imap_config["password"])
+            status, _ = client.select(imap_config["inbox"])
             if status != "OK":
-                raise IMAPPollError(f"Failed to select inbox {imap_config.inbox!r}")
+                raise IMAPPollError(f"Failed to select inbox {imap_config["inbox"]!r}")
 
             status, data = client.uid("SEARCH", None, "UNSEEN")
             if status != "OK":

@@ -167,18 +167,19 @@ def test_poll_inbox_uses_uid_search_and_header_first_whitelist_check(monkeypatch
     fake = _FakeIMAP()
     monkeypatch.setattr("backhead.mail._open_imap_connection", lambda config: fake)
 
-    class _IMAPConfig:
-        host = "imap"
-        port = 993
-        username = "u"
-        password = "p"
-        inbox = "INBOX"
-        use_ssl = True
+    imap_config = {
+        "host": "imap",
+        "port": 993,
+        "username": "u",
+        "password": "p",
+        "inbox": "INBOX",
+        "use_ssl": True,
+    }
 
     results = poll_inbox(
         conn=conn,
         whitelist={"alice@example.com"},
-        imap_config=_IMAPConfig(),
+        imap_config=imap_config,
         spam_mailbox="Junk",
     )
 
@@ -239,12 +240,17 @@ def test_uid_search_returns_uids_used_by_subsequent_operations(monkeypatch):
     fake = _FakeIMAP()
     monkeypatch.setattr("backhead.mail._open_imap_connection", lambda config: fake)
 
-    class _IMAPConfig:
-        host = "imap"; port = 993; username = "u"; password = "p"
-        inbox = "INBOX"; use_ssl = True
+    imap_config = {
+        "host": "imap",
+        "port": 993,
+        "username": "u",
+        "password": "p",
+        "inbox": "INBOX",
+        "use_ssl": True,
+    }
 
     poll_inbox(conn=conn, whitelist={"alice@example.com"},
-               imap_config=_IMAPConfig(), spam_mailbox="Junk")
+               imap_config=imap_config, spam_mailbox="Junk")
 
     uid_commands = [c for c in fake.calls if c[0] == "uid"]
     commands_used = {c[1] for c in uid_commands}
@@ -264,12 +270,17 @@ def test_header_fetch_uses_body_peek_not_rfc822(monkeypatch):
     fake = _FakeIMAP()
     monkeypatch.setattr("backhead.mail._open_imap_connection", lambda config: fake)
 
-    class _IMAPConfig:
-        host = "imap"; port = 993; username = "u"; password = "p"
-        inbox = "INBOX"; use_ssl = True
+    imap_config = {
+        "host": "imap",
+        "port": 993,
+        "username": "u",
+        "password": "p",
+        "inbox": "INBOX",
+        "use_ssl": True,
+    }
 
     poll_inbox(conn=conn, whitelist={"alice@example.com"},
-               imap_config=_IMAPConfig(), spam_mailbox="Junk")
+               imap_config=imap_config, spam_mailbox="Junk")
 
     header_fetches = [
         c for c in fake.calls
@@ -286,12 +297,17 @@ def test_full_fetch_uses_body_peek_not_rfc822(monkeypatch):
     fake = _FakeIMAP()
     monkeypatch.setattr("backhead.mail._open_imap_connection", lambda config: fake)
 
-    class _IMAPConfig:
-        host = "imap"; port = 993; username = "u"; password = "p"
-        inbox = "INBOX"; use_ssl = True
+    imap_config = {
+        "host": "imap",
+        "port": 993,
+        "username": "u",
+        "password": "p",
+        "inbox": "INBOX",
+        "use_ssl": True,
+    }
 
     poll_inbox(conn=conn, whitelist={"alice@example.com"},
-               imap_config=_IMAPConfig(), spam_mailbox="Junk")
+               imap_config=imap_config, spam_mailbox="Junk")
 
     full_fetches = [
         c for c in fake.calls
@@ -308,12 +324,17 @@ def test_seen_set_only_after_successful_storage(monkeypatch):
     fake = _FakeIMAP()
     monkeypatch.setattr("backhead.mail._open_imap_connection", lambda config: fake)
 
-    class _IMAPConfig:
-        host = "imap"; port = 993; username = "u"; password = "p"
-        inbox = "INBOX"; use_ssl = True
+    imap_config = {
+        "host": "imap",
+        "port": 993,
+        "username": "u",
+        "password": "p",
+        "inbox": "INBOX",
+        "use_ssl": True,
+    }
 
     results = poll_inbox(conn=conn, whitelist={"alice@example.com"},
-                         imap_config=_IMAPConfig(), spam_mailbox="Junk")
+                         imap_config=imap_config, spam_mailbox="Junk")
 
     queued = [r for r in results if r["status"] == "queued"]
     assert len(queued) == 1
@@ -338,13 +359,18 @@ def test_storage_failure_leaves_message_unseen(monkeypatch):
     fake = _FakeIMAP()
     monkeypatch.setattr("backhead.mail._open_imap_connection", lambda config: fake)
 
-    class _IMAPConfig:
-        host = "imap"; port = 993; username = "u"; password = "p"
-        inbox = "INBOX"; use_ssl = True
+    imap_config = {
+        "host": "imap",
+        "port": 993,
+        "username": "u",
+        "password": "p",
+        "inbox": "INBOX",
+        "use_ssl": True,
+    }
 
     with pytest.raises(IMAPPollError):
         poll_inbox(conn=conn, whitelist={"alice@example.com"},
-                   imap_config=_IMAPConfig(), spam_mailbox="Junk")
+                   imap_config=imap_config, spam_mailbox="Junk")
 
     seen_calls = [
         c for c in fake.calls
